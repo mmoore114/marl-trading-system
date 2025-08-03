@@ -1,4 +1,5 @@
 import pandas as pd
+import numpy as np # Import numpy
 from ta.momentum import rsi
 from ta.trend import macd, macd_signal, ema_indicator
 from ta.volatility import bollinger_hband, bollinger_lband, bollinger_pband, average_true_range
@@ -28,14 +29,17 @@ def add_features(df):
     # --- Volume Indicators ---
     df['OBV'] = on_balance_volume(df['Close'], df['Volume'])
 
-    # Drop rows with NaN values resulting from indicator calculations
+    # IMPORTANT: Replace infinite values with NaN
+    df.replace([np.inf, -np.inf], np.nan, inplace=True)
+
+    # Drop rows with any NaN values
     df.dropna(inplace=True)
 
     return df
 
 # --- Testing Block ---
 if __name__ == "__main__":
-    # Define paths, assuming script is run from project root
+    # Define paths
     raw_data_path = Path("data/raw/AAPL.csv")
     processed_data_path = Path("data/processed")
 
@@ -58,9 +62,5 @@ if __name__ == "__main__":
     output_file = processed_data_path / "AAPL_processed.csv"
     processed_df.to_csv(output_file)
 
-    print("Feature engineering complete with 'ta' library.")
+    print("Feature engineering complete. Data cleaned of inf and NaN values.")
     print(f"Processed data saved to {output_file}")
-    print("\n--- First 5 Rows of Processed Data ---")
-    print(processed_df.head())
-    print("\n--- Last 5 Rows of Processed Data ---")
-    print(processed_df.tail())
