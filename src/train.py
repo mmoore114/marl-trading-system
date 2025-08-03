@@ -29,7 +29,7 @@ env = VecNormalize(env, norm_obs=True, norm_reward=False, clip_obs=10.)
 print("Creating PPO agent...")
 # 'MlpPolicy' is a standard feed-forward neural network policy.
 # verbose=1 will print out training progress.
-model = PPO("MlpPolicy", env, verbose=1, learning_rate=0.000025)
+model = PPO("MlpPolicy", env, verbose=1)
 
 # --- 3. Train the Agent ---
 print("Training agent...")
