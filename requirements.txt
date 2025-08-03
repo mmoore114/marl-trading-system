@@ -10,3 +10,4 @@ newsapi-python
 jupyter
 matplotlib
 seaborn
+ta
