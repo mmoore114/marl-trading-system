@@ -20,3 +20,8 @@ venv/
 
 # Notebooks
 .ipynb_checkpoints
+.env
+# (keep all the existing content)
+
+# Secrets
+.env
