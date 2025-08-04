@@ -1,0 +1,34 @@
+# --------------------
+# Data Settings
+# --------------------
+data_settings:
+  # List of stock tickers to download and process
+  tickers:
+    - "AAPL"
+    - "MSFT"
+    - "GOOGL"
+    - "AMZN"
+
+  # Date range for the entire dataset
+  start_date: "2010-01-01"
+  end_date: "2024-12-31"
+
+  # Date to split training and testing data. Data up to this date is for training.
+  train_end_date: "2021-12-31"
+
+# --------------------
+# Model Settings
+# --------------------
+model_settings:
+  # Total number of simulation steps to train the agent for
+  total_timesteps: 50000
+  # Stable learning rate we discovered during debugging
+  learning_rate: 0.000025
+
+# --------------------
+# Environment Settings
+# --------------------
+environment_settings:
+  initial_balance: 100000
+  commission_fee: 0.001
+  trade_limit_percent: 0.1

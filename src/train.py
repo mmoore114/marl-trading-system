@@ -1,44 +1,61 @@
 import pandas as pd
+import yaml
 from pathlib import Path
 from stable_baselines3 import PPO
 from stable_baselines3.common.vec_env import DummyVecEnv, VecNormalize
 
-# Import our custom environment
-from environment import StockTradingEnv
+# Import our new custom environment
+from environment import MultiStockEnv
 
-# Define paths
-processed_data_path = Path("data/processed/AAPL_processed.csv")
-models_path = Path("models")
+# --- 1. Load Configuration ---
+try:
+    with open("config.yaml", "r") as f:
+        config = yaml.safe_load(f)
+    
+    TICKERS = config['data_settings']['tickers']
+    TRAIN_END_DATE = config['data_settings']['train_end_date']
+    MODEL_SETTINGS = config['model_settings']
 
-# Ensure models directory exists
-models_path.mkdir(parents=True, exist_ok=True)
+except FileNotFoundError:
+    print("Error: config.yaml not found.")
+    exit()
 
-# --- 1. Load Data and Create Environment ---
-print("Loading data and creating environment...")
-df = pd.read_csv(processed_data_path, index_col=0, parse_dates=True)
 
-# Wrap the custom environment in a DummyVecEnv for compatibility
-env_lambda = lambda: StockTradingEnv(df)
+# --- 2. Load Data for All Tickers ---
+print("Loading data for all tickers...")
+processed_data_dir = Path("data/processed")
+data_dict = {}
+for ticker in TICKERS:
+    file_path = processed_data_dir / f"{ticker}_processed.csv"
+    data_dict[ticker] = pd.read_csv(file_path, index_col=0, parse_dates=True)
+
+
+# --- 3. Create the Multi-Stock Environment ---
+print("Creating multi-stock environment...")
+env_lambda = lambda: MultiStockEnv(data_dict, TRAIN_END_DATE)
 env = DummyVecEnv([env_lambda])
-
-# Wrap it with the VecNormalize wrapper for observation normalization
 env = VecNormalize(env, norm_obs=True, norm_reward=False, clip_obs=10.)
 
 
-# --- 2. Create and Configure the Agent ---
-print("Creating PPO agent...")
-# 'MlpPolicy' is a standard feed-forward neural network policy.
-# verbose=1 will print out training progress.
-model = PPO("MlpPolicy", env, verbose=1)
+# --- 4. Create and Train the Agent ---
+print("Creating and training the PPO Super-Agent...")
+model = PPO(
+    "MlpPolicy", 
+    env, 
+    verbose=1, 
+    learning_rate=MODEL_SETTINGS['learning_rate']
+)
 
-# --- 3. Train the Agent ---
-print("Training agent...")
-# total_timesteps is the number of simulation steps the agent will learn from.
-model.learn(total_timesteps=20000)
+model.learn(total_timesteps=MODEL_SETTINGS['total_timesteps'])
 
-# --- 4. Save the Trained Model and Normalization Stats ---
-model_save_path = models_path / "ppo_stock_trader.zip"
-stats_path = models_path / "vec_normalize_stats.pkl"
+
+# --- 5. Save the Trained Model and Normalization Stats ---
+print("Saving model and normalization stats...")
+models_path = Path("models")
+models_path.mkdir(parents=True, exist_ok=True)
+
+model_save_path = models_path / "ppo_multi_stock_trader.zip"
+stats_path = models_path / "multi_stock_vec_normalize_stats.pkl"
 
 model.save(model_save_path)
 env.save(stats_path)
