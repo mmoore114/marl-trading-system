@@ -1,34 +1,14 @@
-# --------------------
-# Data Settings
-# --------------------
 data_settings:
-  # List of stock tickers to download and process
-  tickers:
-    - "AAPL"
-    - "MSFT"
-    - "GOOGL"
-    - "AMZN"
+  tickers: ['AAPL', 'MSFT', 'GOOGL', 'AMZN', 'TSLA', 'NVDA', 'META', 'JPM', 'PFE', 'XOM', 'PG', 'GE', 'DUK', 'DOW', 'SPG']
+  train_end_date: '2022-12-31'  # Train to 2022
+  val_end_date: '2023-12-31'    # New: Val 2023
 
-  # Date range for the entire dataset
-  start_date: "2010-01-01"
-  end_date: "2024-12-31"
-
-  # Date to split training and testing data. Data up to this date is for training.
-  train_end_date: "2021-12-31"
-
-# --------------------
-# Model Settings
-# --------------------
 model_settings:
-  # Total number of simulation steps to train the agent for
-  total_timesteps: 50000
-  # Stable learning rate we discovered during debugging
-  learning_rate: 0.000025
+  learning_rate: 0.0003
+  total_timesteps: 500000       # Increased
 
-# --------------------
-# Environment Settings
-# --------------------
 environment_settings:
-  initial_balance: 100000
-  commission_fee: 0.001
-  trade_limit_percent: 0.1
+  initial_balance: 15000
+  risk_aversion: 0.5
+  lookback_period: 20
+  min_data_length: 250

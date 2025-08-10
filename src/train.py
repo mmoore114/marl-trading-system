@@ -3,62 +3,88 @@ import yaml
 from pathlib import Path
 from stable_baselines3 import PPO
 from stable_baselines3.common.vec_env import DummyVecEnv, VecNormalize
+from stable_baselines3.common.callbacks import EvalCallback
+import numpy as np  # Added to fix np.mean/std NameError
 
-# Import our new custom environment
-from environment import MultiStockEnv
+from environment import MultiStrategyEnv
 
-# --- 1. Load Configuration ---
+# Load config
 try:
     with open("config.yaml", "r") as f:
         config = yaml.safe_load(f)
-    
     TICKERS = config['data_settings']['tickers']
     TRAIN_END_DATE = config['data_settings']['train_end_date']
+    VAL_END_DATE = config['data_settings']['val_end_date']
     MODEL_SETTINGS = config['model_settings']
-
+    INITIAL_BALANCE = config['environment_settings']['initial_balance']  # Added for val eval
 except FileNotFoundError:
     print("Error: config.yaml not found.")
     exit()
 
-
-# --- 2. Load Data for All Tickers ---
-print("Loading data for all tickers...")
+# Load data (skip extra rows, name columns)
+print("Loading data...")
 processed_data_dir = Path("data/processed")
-data_dict = {}
-for ticker in TICKERS:
-    file_path = processed_data_dir / f"{ticker}_processed.csv"
-    data_dict[ticker] = pd.read_csv(file_path, index_col=0, parse_dates=True)
+data_dict = {ticker: pd.read_csv(processed_data_dir / f"{ticker}_processed.csv", skiprows=3, header=None, names=['Date', 'Close'], index_col='Date', parse_dates=True) for ticker in TICKERS}
 
+# Create train env
+print("Creating train environment...")
+train_env_lambda = lambda: MultiStrategyEnv(data_dict, TRAIN_END_DATE, VAL_END_DATE, mode='train')
+train_env = DummyVecEnv([train_env_lambda])
+train_env = VecNormalize(train_env, norm_obs=True, norm_reward=False, clip_obs=10.)
 
-# --- 3. Create the Multi-Stock Environment ---
-print("Creating multi-stock environment...")
-env_lambda = lambda: MultiStockEnv(data_dict, TRAIN_END_DATE)
-env = DummyVecEnv([env_lambda])
-env = VecNormalize(env, norm_obs=True, norm_reward=False, clip_obs=10.)
+# Create val env
+print("Creating val environment...")
+val_env_lambda = lambda: MultiStrategyEnv(data_dict, TRAIN_END_DATE, VAL_END_DATE, mode='val')
+val_env = DummyVecEnv([val_env_lambda])
+val_env = VecNormalize(val_env, norm_obs=True, norm_reward=False, clip_obs=10.)  # Separate norm for val
 
+# Grid search learning rates
+learning_rates = [1e-4, 3e-4, 1e-3]
+best_model = None
+best_sharpe = -float('inf')
 
-# --- 4. Create and Train the Agent ---
-print("Creating and training the PPO Super-Agent...")
-model = PPO(
-    "MlpPolicy", 
-    env, 
-    verbose=1, 
-    learning_rate=MODEL_SETTINGS['learning_rate']
-)
+for lr in learning_rates:
+    print(f"Training with lr={lr}...")
+    model = PPO(
+        "MlpPolicy", 
+        train_env, 
+        verbose=1, 
+        learning_rate=lr
+    )
+    
+    # Eval callback for early stopping
+    eval_callback = EvalCallback(
+        val_env, 
+        best_model_save_path="models/best_model",
+        log_path="logs/",
+        eval_freq=10000,
+        deterministic=True,
+        render=False,
+        n_eval_episodes=1,
+        warn=False
+    )
+    
+    model.learn(total_timesteps=MODEL_SETTINGS['total_timesteps'], callback=eval_callback)
+    
+    # Quick val eval for Sharpe (simplified; adapt if needed)
+    obs = val_env.reset()
+    done = [False]
+    returns = []
+    while not done[0]:
+        action, _ = model.predict(obs, deterministic=True)
+        obs, _, done, info = val_env.step(action)
+        returns.append(info[0]['portfolio_value'] / INITIAL_BALANCE - 1)  # Cumulative return proxy
+    val_sharpe = np.mean(returns) / np.std(returns) if np.std(returns) > 0 else 0
+    
+    if val_sharpe > best_sharpe:
+        best_sharpe = val_sharpe
+        best_model = model
 
-model.learn(total_timesteps=MODEL_SETTINGS['total_timesteps'])
-
-
-# --- 5. Save the Trained Model and Normalization Stats ---
-print("Saving model and normalization stats...")
+# Save best
 models_path = Path("models")
 models_path.mkdir(parents=True, exist_ok=True)
+best_model.save(models_path / "ppo_multi_strategy_trader.zip")
+train_env.save(models_path / "multi_strategy_vec_normalize_stats.pkl")
 
-model_save_path = models_path / "ppo_multi_stock_trader.zip"
-stats_path = models_path / "multi_stock_vec_normalize_stats.pkl"
-
-model.save(model_save_path)
-env.save(stats_path)
-
-print(f"\nTraining complete. Model saved to {model_save_path}")
-print(f"Normalization stats saved to {stats_path}")
+print(f"\nTraining complete. Best model (lr={best_model.learning_rate}) saved to {models_path / 'ppo_multi_strategy_trader.zip'}")
+print(f"Normalization stats saved to {models_path / 'multi_strategy_vec_normalize_stats.pkl'}")
