@@ -13,3 +13,6 @@ seaborn
 ta
 gymnasium
 quantstats
+tqdm
+PyYAML
+python-dotenv

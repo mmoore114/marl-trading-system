@@ -4,87 +4,81 @@ from pathlib import Path
 from stable_baselines3 import PPO
 from stable_baselines3.common.vec_env import DummyVecEnv, VecNormalize
 from stable_baselines3.common.callbacks import EvalCallback
-import numpy as np  # Added to fix np.mean/std NameError
 
+# Import your custom environment
 from environment import MultiStrategyEnv
 
-# Load config
+# --- 1. Load Configuration ---
 try:
     with open("config.yaml", "r") as f:
         config = yaml.safe_load(f)
     TICKERS = config['data_settings']['tickers']
-    TRAIN_END_DATE = config['data_settings']['train_end_date']
-    VAL_END_DATE = config['data_settings']['val_end_date']
     MODEL_SETTINGS = config['model_settings']
-    INITIAL_BALANCE = config['environment_settings']['initial_balance']  # Added for val eval
-except FileNotFoundError:
-    print("Error: config.yaml not found.")
+except (FileNotFoundError, KeyError) as e:
+    print(f"Error loading configuration: {e}")
     exit()
 
-# Load data (skip extra rows, name columns)
-print("Loading data...")
+# --- 2. Load Data ---
+print("Loading data for all tickers...")
 processed_data_dir = Path("data/processed")
-data_dict = {ticker: pd.read_csv(processed_data_dir / f"{ticker}_processed.csv", skiprows=3, header=None, names=['Date', 'Close'], index_col='Date', parse_dates=True) for ticker in TICKERS}
+data_dict = {}
+for ticker in TICKERS:
+    file_path = processed_data_dir / f"{ticker}_processed.csv"
+    data_dict[ticker] = pd.read_csv(file_path, index_col='Date', parse_dates=True)
 
-# Create train env
-print("Creating train environment...")
-train_env_lambda = lambda: MultiStrategyEnv(data_dict, TRAIN_END_DATE, VAL_END_DATE, mode='train')
+
+# --- 3. Create Training and Validation Environments ---
+print("Creating environments...")
+# The environment for training
+train_env_lambda = lambda: MultiStrategyEnv(data_dict, config, mode='train')
 train_env = DummyVecEnv([train_env_lambda])
 train_env = VecNormalize(train_env, norm_obs=True, norm_reward=False, clip_obs=10.)
 
-# Create val env
-print("Creating val environment...")
-val_env_lambda = lambda: MultiStrategyEnv(data_dict, TRAIN_END_DATE, VAL_END_DATE, mode='val')
+# The environment for validation
+# FIX: The validation environment must ALSO be wrapped in VecNormalize
+val_env_lambda = lambda: MultiStrategyEnv(data_dict, config, mode='val')
 val_env = DummyVecEnv([val_env_lambda])
-val_env = VecNormalize(val_env, norm_obs=True, norm_reward=False, clip_obs=10.)  # Separate norm for val
+val_env = VecNormalize(val_env, norm_obs=True, norm_reward=False, clip_obs=10.)
 
-# Grid search learning rates
-learning_rates = [1e-4, 3e-4, 1e-3]
-best_model = None
-best_sharpe = -float('inf')
 
-for lr in learning_rates:
-    print(f"Training with lr={lr}...")
-    model = PPO(
-        "MlpPolicy", 
-        train_env, 
-        verbose=1, 
-        learning_rate=lr
-    )
-    
-    # Eval callback for early stopping
-    eval_callback = EvalCallback(
-        val_env, 
-        best_model_save_path="models/best_model",
-        log_path="logs/",
-        eval_freq=10000,
-        deterministic=True,
-        render=False,
-        n_eval_episodes=1,
-        warn=False
-    )
-    
-    model.learn(total_timesteps=MODEL_SETTINGS['total_timesteps'], callback=eval_callback)
-    
-    # Quick val eval for Sharpe (simplified; adapt if needed)
-    obs = val_env.reset()
-    done = [False]
-    returns = []
-    while not done[0]:
-        action, _ = model.predict(obs, deterministic=True)
-        obs, _, done, info = val_env.step(action)
-        returns.append(info[0]['portfolio_value'] / INITIAL_BALANCE - 1)  # Cumulative return proxy
-    val_sharpe = np.mean(returns) / np.std(returns) if np.std(returns) > 0 else 0
-    
-    if val_sharpe > best_sharpe:
-        best_sharpe = val_sharpe
-        best_model = model
+# --- 4. Define Callback and Train the Agent ---
+eval_callback = EvalCallback(
+    val_env,
+    best_model_save_path="./models/best_model/",
+    log_path="./logs/",
+    eval_freq=10000,
+    deterministic=True,
+    render=False,
+    n_eval_episodes=1,
+    warn=False
+)
 
-# Save best
+print("Creating and training the PPO Super-Agent...")
+model = PPO(
+    "MlpPolicy", 
+    train_env, 
+    verbose=1, 
+    learning_rate=MODEL_SETTINGS.get('learning_rate', 0.0003)
+)
+
+model.learn(
+    total_timesteps=MODEL_SETTINGS.get('total_timesteps', 50000), 
+    callback=eval_callback
+)
+
+
+# --- 5. Save the Final Best Model and Stats ---
+print("Saving final best model and normalization stats...")
 models_path = Path("models")
-models_path.mkdir(parents=True, exist_ok=True)
-best_model.save(models_path / "ppo_multi_strategy_trader.zip")
-train_env.save(models_path / "multi_strategy_vec_normalize_stats.pkl")
+final_model_path = models_path / "ppo_multi_strategy_final.zip"
+stats_path = models_path / "multi_strategy_vec_normalize.pkl"
 
-print(f"\nTraining complete. Best model (lr={best_model.learning_rate}) saved to {models_path / 'ppo_multi_strategy_trader.zip'}")
-print(f"Normalization stats saved to {models_path / 'multi_strategy_vec_normalize_stats.pkl'}")
+# The best model was saved by the callback, so we load it from there
+best_model = PPO.load(models_path / "best_model/best_model.zip")
+best_model.save(final_model_path)
+
+# Save the normalization stats from the training environment
+train_env.save(stats_path)
+
+print(f"\nTraining complete. Best model saved to {final_model_path}")
+print(f"Normalization stats saved to {stats_path}")

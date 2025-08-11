@@ -2,142 +2,109 @@ import gymnasium as gym
 import numpy as np
 import pandas as pd
 from gymnasium import spaces
-from pathlib import Path
 import yaml
 
-try:
-    with open("config.yaml", "r") as f:
-        config = yaml.safe_load(f)
-    INITIAL_BALANCE = config['environment_settings']['initial_balance']
-    RISK_AVERSION = config.get('environment_settings', {}).get('risk_aversion', 0.5)
-    LOOKBACK_PERIOD = config.get('environment_settings', {}).get('lookback_period', 20)
-    RSI_PERIOD = 14
-    MACD_FAST = 12
-    MACD_SLOW = 26
-    MACD_SIGNAL = 9
-    MIN_DATA_LENGTH = config.get('environment_settings', {}).get('min_data_length', 250)
-except FileNotFoundError:
-    print("Error: config.yaml not found.")
-    exit()
-
 class MultiStrategyEnv(gym.Env):
-    def __init__(self, data_dict, train_end_date, val_end_date=None, mode='train'):
+    def __init__(self, data_dict, config, mode='train'):
         super().__init__()
         
+        self.config = config
+        self.mode = mode
         self.tickers = list(data_dict.keys())
         self.n_stocks = len(self.tickers)
         
-        if mode == 'train':
-            self.df = {ticker: df[df.index <= pd.to_datetime(train_end_date)].copy() for ticker, df in data_dict.items()}
-        elif mode == 'val' and val_end_date:
-            self.df = {ticker: df[(df.index > pd.to_datetime(train_end_date)) & (df.index <= pd.to_datetime(val_end_date))].copy() for ticker, df in data_dict.items()}
-        else:  # test
-            start = pd.to_datetime(val_end_date or train_end_date)
-            self.df = {ticker: df[df.index > start].copy() for ticker, df in data_dict.items()}
+        # --- Environment Settings ---
+        self.initial_balance = self.config['environment_settings']['initial_balance']
+        self.risk_aversion = self.config['environment_settings']['risk_aversion']
         
-        # Align to common index with ffill for missing data
-        if self.df:
-            indices = [df.index for df in self.df.values()]
-            common_index = indices[0]
-            for idx in indices[1:]:
-                common_index = common_index.intersection(idx)
-            for ticker in self.tickers:
-                self.df[ticker] = self.df[ticker].reindex(common_index).ffill().dropna()
+        # --- Data Handling ---
+        self._prepare_data(data_dict)
         
-        for ticker, df in self.df.items():
-            if len(df) < MIN_DATA_LENGTH:
-                raise ValueError(f"{ticker} has only {len(df)} rows in {mode} mode after alignment.")
-        
-        lengths = [len(df) for df in self.df.values()]
-        if len(set(lengths)) > 1:
-            raise ValueError(f"Inconsistent lengths in {mode} data after alignment: {lengths}")
-        self.max_steps = lengths[0] - 1 if lengths else 0
-        
-        self.prev_weights = np.zeros(self.n_stocks)
-        
-        for ticker in self.tickers:
-            df = self.df[ticker]
-            if 'Close' not in df.columns:
-                raise ValueError(f"'Close' column missing for {ticker}.")
-            
-            df['Momentum'] = df['Close'].pct_change(LOOKBACK_PERIOD)
-            df['Volatility'] = df['Close'].pct_change().rolling(LOOKBACK_PERIOD).std()
-            df['RSI'] = self._calculate_rsi(df['Close'])
-            df['MACD'], df['MACD_Signal'] = self._calculate_macd(df['Close'])
-            df['Golden_Cross'] = (df['Close'].rolling(50).mean() > df['Close'].rolling(200).mean()).astype(float)
-            df['Volume_Norm'] = np.log(df['Volume'] + 1)  # Add normalized Volume (log to handle scale)
-            df.fillna(0, inplace=True)
-        
-        self.feature_cols = ['Close', 'Momentum', 'Volatility', 'RSI', 'MACD', 'MACD_Signal', 'Golden_Cross', 'Volume_Norm']  # Added Volume_Norm
-        
-        for ticker in self.tickers:
-            missing_cols = set(self.feature_cols) - set(self.df[ticker].columns)
-            if missing_cols:
-                raise ValueError(f"Missing columns {missing_cols} for {ticker} after feature calculation.")
-            self.df[ticker] = self.df[ticker][self.feature_cols]
-        
-        n_features = len(self.feature_cols)
-        self.observation_space = spaces.Box(low=-np.inf, high=np.inf, shape=(self.n_stocks * n_features,), dtype=np.float32)
+        # --- Spaces ---
+        n_features = self.df[self.tickers[0]].shape[1]
+        self.observation_space = spaces.Box(low=-np.inf, high=np.inf, shape=(self.n_stocks, n_features), dtype=np.float32)
         self.action_space = spaces.Box(low=0, high=1, shape=(self.n_stocks,), dtype=np.float32)
         
+        # --- State Variables ---
         self.current_step = 0
-        self.portfolio_value = INITIAL_BALANCE
+        self.portfolio_value = self.initial_balance
+        self.portfolio_weights = np.array([1.0] + [0.0] * self.n_stocks) # [cash_weight, stock1_weight, ...]
+        
+    def _prepare_data(self, data_dict):
+        """Prepares and splits data based on the mode."""
+        train_end = pd.to_datetime(self.config['data_settings']['train_end_date'])
+        val_end = pd.to_datetime(self.config['data_settings']['val_end_date'])
+        
+        if self.mode == 'train':
+            self.df = {ticker: df[df.index <= train_end].copy() for ticker, df in data_dict.items()}
+        elif self.mode == 'val':
+            self.df = {ticker: df[(df.index > train_end) & (df.index <= val_end)].copy() for ticker, df in data_dict.items()}
+        else: # test mode
+            self.df = {ticker: df[df.index > val_end].copy() for ticker, df in data_dict.items()}
 
-    def _calculate_rsi(self, series):
-        delta = series.diff()
-        gain = delta.where(delta > 0, 0).rolling(window=RSI_PERIOD).mean()
-        loss = -delta.where(delta < 0, 0).rolling(window=RSI_PERIOD).mean()
-        rs = gain / loss
-        rsi = 100 - (100 / (1 + rs))
-        return rsi
-
-    def _calculate_macd(self, series):
-        ema_fast = series.ewm(span=MACD_FAST, adjust=False).mean()
-        ema_slow = series.ewm(span=MACD_SLOW, adjust=False).mean()
-        macd = ema_fast - ema_slow
-        signal = macd.ewm(span=MACD_SIGNAL, adjust=False).mean()
-        return macd, signal
+        # Align to common trading days
+        common_index = self.df[self.tickers[0]].index
+        for ticker in self.tickers[1:]:
+            common_index = common_index.intersection(self.df[ticker].index)
+        
+        for ticker in self.tickers:
+            self.df[ticker] = self.df[ticker].reindex(common_index).ffill()
+            
+        self.max_steps = len(common_index) - 2 # -2 to ensure we can always get next price
 
     def _get_obs(self):
-        obs = np.array([df.iloc[self.current_step][self.feature_cols].values for df in self.df.values()])
-        return obs.flatten().astype(np.float32)
+        obs = np.array([df.iloc[self.current_step].values for df in self.df.values()])
+        return obs.astype(np.float32)
 
     def _get_info(self):
-        return {'portfolio_value': self.portfolio_value}
+        return {'portfolio_value': self.portfolio_value, 'weights': self.portfolio_weights[1:]}
 
     def reset(self, seed=None, options=None):
         super().reset(seed=seed)
         self.current_step = 0
-        self.portfolio_value = INITIAL_BALANCE
-        self.prev_weights = np.zeros(self.n_stocks)
+        self.portfolio_value = self.initial_balance
+        self.portfolio_weights = np.array([1.0] + [0.0] * self.n_stocks)
         return self._get_obs(), self._get_info()
 
     def step(self, action):
-        action = np.clip(action, 0, 1)
-        target_weights = action / np.sum(action) if np.sum(action) > 0 else np.ones(self.n_stocks) / self.n_stocks
-        print(f"Step action (normalized): {target_weights}, sum: {np.sum(target_weights)}")  # Debug
+        # Normalize actions to represent portfolio weights summing to 1
+        target_weights = np.clip(action, 0, 1)
+        target_weights /= np.sum(target_weights) if np.sum(target_weights) > 0 else 1
+        
+        # --- Transaction Cost Calculation (Corrected) ---
+        # Get current weights from portfolio state
+        current_weights = self.portfolio_weights[1:] # Exclude cash weight
+        
+        # Calculate the value of trades
+        trades = (target_weights - current_weights) * self.portfolio_value
+        transaction_cost = np.sum(np.abs(trades)) * 0.001 # 0.1% commission
 
-        # Transaction costs: 0.1% on weight changes
-        weight_diff = np.abs(target_weights - self.prev_weights)
-        trans_cost = 0.001 * self.portfolio_value * np.sum(weight_diff)
-        self.portfolio_value -= trans_cost
-        self.prev_weights = target_weights.copy()
-
+        # --- Portfolio Return Calculation ---
         price_changes = []
         volatilities = []
         for ticker in self.tickers:
             current_price = self.df[ticker]['Close'].iloc[self.current_step]
             next_price = self.df[ticker]['Close'].iloc[self.current_step + 1]
-            price_change = (next_price - current_price) / current_price
-            price_changes.append(price_change)
-            volatilities.append(self.df[ticker]['Volatility'].iloc[self.current_step])
-        
+            price_changes.append((next_price - current_price) / current_price)
+            volatilities.append(self.df[ticker].get('Volatility', 0.01)) # Safely get volatility
+
         portfolio_return = np.dot(target_weights, price_changes)
-        avg_vol = np.mean(volatilities)
-        new_portfolio_value = self.portfolio_value * (1 + portfolio_return)
-        log_return = np.log(new_portfolio_value / self.portfolio_value) if self.portfolio_value > 0 else 0
-        reward = log_return - RISK_AVERSION * avg_vol
-        self.portfolio_value = new_portfolio_value
+        
+        # Update portfolio value
+        self.portfolio_value *= (1 + portfolio_return)
+        self.portfolio_value -= transaction_cost
+        
+        # Update portfolio weights for the next step
+        new_asset_values = target_weights * self.portfolio_value
+        self.portfolio_weights = np.insert(new_asset_values, 0, self.portfolio_value - np.sum(new_asset_values)) / self.portfolio_value
+
+        # --- Reward Calculation ---
+        log_return = np.log(self.portfolio_value / (self.portfolio_value - portfolio_return*self.portfolio_value + transaction_cost)) if self.portfolio_value > 0 else 0
+        portfolio_volatility = np.dot(target_weights, volatilities)
+        reward = log_return - self.risk_aversion * portfolio_volatility
+        
+        # --- State Update ---
         self.current_step += 1
-        terminated = self.current_step >= self.max_steps - 1
+        terminated = self.current_step >= self.max_steps
+
         return self._get_obs(), reward, terminated, False, self._get_info()

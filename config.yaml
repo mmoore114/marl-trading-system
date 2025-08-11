@@ -1,14 +1,57 @@
+# --------------------
+# Data Settings
+# --------------------
 data_settings:
+  # List of stock tickers to download and process
   tickers: ['AAPL', 'MSFT', 'GOOGL', 'AMZN', 'TSLA', 'NVDA', 'META', 'JPM', 'PFE', 'XOM', 'PG', 'GE', 'DUK', 'DOW', 'SPG']
-  train_end_date: '2022-12-31'  # Train to 2022
-  val_end_date: '2023-12-31'    # New: Val 2023
+  
+  # Date range for the entire dataset
+  start_date: "2010-01-01"
+  end_date: "2024-12-31"
 
+  # Defines the last day of the training data
+  train_end_date: '2022-12-31'
+  
+  # Defines the last day of the validation data
+  val_end_date: '2023-12-31'
+
+# --------------------
+# Factor Settings
+# --------------------
+factor_settings:
+  RSI:
+    enabled: true
+    window: 14
+  MACD:
+    enabled: true
+    fast: 12
+    slow: 26
+    signal: 9
+  EMA:
+    enabled: true
+    windows: [20, 50, 200]
+  BBands:
+    enabled: true
+    window: 20
+    std: 2
+  ATR:
+    enabled: true
+    window: 14
+  OBV:
+    enabled: true
+
+# --------------------
+# Model Settings
+# --------------------
 model_settings:
   learning_rate: 0.0003
-  total_timesteps: 500000       # Increased
+  total_timesteps: 500000
 
+# --------------------
+# Environment Settings
+# --------------------
 environment_settings:
   initial_balance: 15000
-  risk_aversion: 0.5
+  risk_aversion: 0.3
   lookback_period: 20
   min_data_length: 250
