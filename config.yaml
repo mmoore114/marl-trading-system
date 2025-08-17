@@ -39,12 +39,17 @@ factor_settings:
     window: 14
   OBV:
     enabled: true
+  Hurst:            
+    enabled: true
+    window: 252
 
-# --------------------
+
+## --------------------
 # Model Settings
 # --------------------
 model_settings:
-  learning_rate: 0.0003
+  # A list of learning rates to test
+  learning_rates: [0.0003, 0.0001, 0.000025] 
   total_timesteps: 500000
 
 # --------------------
@@ -54,4 +59,14 @@ environment_settings:
   initial_balance: 15000
   risk_aversion: 0.3
   lookback_period: 20
-  min_data_length: 250
+  min_data_length: 25
+
+
+# --------------------
+# Reward Function Settings
+# --------------------
+reward_settings:
+  # Penalty for portfolio drawdown
+  drawdown_penalty: 0.2
+  # Penalty for high portfolio turnover (trading costs)
+  turnover_penalty: 0.05

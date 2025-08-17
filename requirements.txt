@@ -16,3 +16,6 @@ quantstats
 tqdm
 PyYAML
 python-dotenv
+hurst
+statsmodels
+hmmlearn
