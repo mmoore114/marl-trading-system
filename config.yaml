@@ -18,31 +18,27 @@ data_settings:
 # --------------------
 # Factor Settings
 # --------------------
+# Defines the factors to be calculated and which agent they belong to.
 factor_settings:
-  RSI:
-    enabled: true
-    window: 14
-  MACD:
-    enabled: true
-    fast: 12
-    slow: 26
-    signal: 9
-  EMA:
-    enabled: true
-    windows: [20, 50, 200]
-  BBands:
-    enabled: true
-    window: 20
-    std: 2
-  ATR:
-    enabled: true
-    window: 14
-  OBV:
-    enabled: true
-  Hurst:            
-    enabled: true
-    window: 252
+  # --- Momentum Agent Factors ---
+  # These factors measure the strength, direction, and persistence of trends.
+  Momentum:
+    RSI_14: { enabled: true, window: 14 }
+    MACD:   { enabled: true, fast: 12, slow: 26, signal: 9 }
+    EMA_Cross_50_200: { enabled: true, fast: 50, slow: 200 }
+    ROC_21: { enabled: true, window: 21 } # Rate of Change over 1 month
 
+  # --- Mean-Reversion Agent Factors ---
+  # These factors measure statistical deviation from a recent average.
+  MeanReversion:
+    BBands_Percent_20: { enabled: true, window: 20, std: 2 }
+    RSI_Reversion_14:  { enabled: true, window: 14 } # RSI used to find overbought/oversold
+
+  # --- Shared Factors ---
+  # Factors that all agents might find useful for context.
+  Shared:
+    Volatility_21: { enabled: true, window: 21 }
+    Hurst_252:     { enabled: true, window: 252 }
 
 ## --------------------
 # Model Settings

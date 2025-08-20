@@ -1,35 +1,68 @@
-# Project Journal: MARL Trading System
+# Project Journal & Status: MARL Trading System
 
-## Project Objective
-To develop a sophisticated, multi-agent reinforcement learning (MARL) system to manage a portfolio of equities, based on technical and alternative data factors.
-
----
-## Current Status (As of August 16, 2025)
-
-The project has successfully evolved from a single-agent prototype to a robust, factor-driven, multi-agent research platform. The system is end-to-end functional.
-
-### Key Architectural Components:
-* **Data Pipeline**: Downloads raw EOD data for 15 stocks using `yfinance`.
-* **Factor Engine**: A config-driven script (`feature_engineering.py`) that calculates a suite of technical factors, including **RSI, MACD, EMAs, Bollinger Bands, ATR, OBV**, and the **Hurst Exponent**.
-* **Regime Detection**: The factor engine now includes a **Hidden Markov Model (HMM)** to train and predict market regimes for each stock, adding regime probabilities as features.
-* **MARL Environment**: A custom `MultiStrategyEnv` that simulates a realistic portfolio with a **train/validation/test split**, and an **advanced risk-aware reward function** that penalizes drawdown and portfolio turnover.
-* **Training Pipeline**: A `train.py` script capable of **hyperparameter tuning** (e.g., testing multiple learning rates) and using an `EvalCallback` to automatically save the best-performing model on the validation set.
-* **Backtester**: A `backtester.py` script that evaluates the final agent on unseen test data and generates a `quantstats` report comparing its performance to an **equal-weight buy-and-hold benchmark**.
-
-### Key Findings & Conclusion:
-* The system is technically robust and the training process is stable.
-* The current agent, trained on technical factors alone, has learned a conservative, risk-managed strategy but **does not consistently outperform its benchmark**.
-* Multiple experiments in tuning the reward function and learning rate have confirmed that we have likely reached the performance limit of the current feature set.
-* **Conclusion**: The project is now **data-constrained**. The next major phase of development requires an upgrade to a professional data source to integrate higher-quality fundamental and news sentiment data.
-
-### Next Steps:
-1.  **Upgrade to EODHD Paid Data Plan.**
-2.  Refactor the data pipeline scripts to use the new EODHD API.
-3.  Integrate fundamental and news sentiment data into the factor engine.
-4.  Re-train and evaluate the agent with this new, richer dataset.
+## 1. Project Objective
+To build a sophisticated, professional-grade Multi-Agent Reinforcement Learning (MARL) system for trading a large universe of U.S. equities. The system is designed with a hierarchical architecture, featuring a team of "specialist agents" that report to a central "Super-Agent" for final portfolio allocation and risk management.
 
 ---
-## (Previous Journal Entries)
 
-### Folder & File Structure
-... (The rest of your journal file remains the same) ...
+## 2. System Architecture & Strategy
+
+The core architecture is a **Hierarchical MARL system** designed for scalability and adaptability to changing market conditions.
+
+* **Specialist Agents (The Analysts)**: A team of agents, each an expert in a specific quantitative strategy (e.g., Momentum, Mean-Reversion). Each specialist analyzes the entire market through its unique lens and produces a set of conviction scores or recommended weights.
+* **Super-Agent (The Portfolio Manager)**: A single, higher-level agent that takes the recommendations from all the specialist agents as its input. Its job is not to analyze raw market data, but to perform **strategy allocation**. It learns to weigh the advice of its specialists based on the current market regime and other high-level data to construct a diversified, risk-managed final portfolio.
+* **Current Implementation**: We have implemented this architecture using a **`MultiInputPolicy`** in `stable-baselines3`. The environment provides a structured, dictionary-based observation where each key corresponds to a specialist's set of factors. The PPO agent automatically creates internal "specialist networks" and a final "super-agent" network to combine their outputs.
+
+---
+
+## 3. Project File Structure & Purpose
+
+### Root Directory
+* **`.gitignore`**: Specifies which files and folders Git should intentionally ignore (e.g., `.venv`, data files, secrets).
+* **`config.yaml`**: The central "control panel" for the project. Defines tickers, dates, train/val/test splits, factor definitions, and model hyperparameters.
+* **`.env`**: A secure, local-only file for storing secret API keys (e.g., for NewsAPI or EODHD).
+* **`requirements.txt`**: An explicit list of all the Python libraries required to run this project.
+
+### `/data`
+Contains all market data.
+* `/raw`: Holds the raw, unprocessed data downloaded from external sources.
+* `/processed`: Holds the feature-rich data files generated by the factor engine. This is the direct input for the RL environment.
+* `/sentiment`: (Planned) For storing processed daily news sentiment scores.
+
+### `/models`
+Contains all saved AI/ML models.
+* `ppo_specialist_super_agent_final.zip`: The saved "brain" of the trained Super-Agent.
+* `specialist_super_agent_vec_normalize.pkl`: The normalization statistics for the environment, crucial for live trading and backtesting.
+* `hmm_model_[TICKER].pkl`: The saved Hidden Markov Models for regime detection for each stock.
+
+### `/notebooks`
+Contains Jupyter Notebooks for research and analysis.
+* `01_data_exploration.ipynb`: Initial data loading and plotting.
+* `02_factor_analysis.ipynb`: Analysis of factor stationarity (ADF test) and market memory (Hurst Exponent).
+* `03_regime_detection.ipynb`: Trains and visualizes the HMM for market regime detection.
+
+### `/src`
+Contains all primary Python source code.
+* **`data_pipeline.py`**: (Deprecated/Legacy) The original script to download raw market data from `yfinance`. Will be replaced by a professional EODHD pipeline.
+* **`feature_engineering.py`**: The "factor engine." Reads raw data and the config file to calculate all factors and regime features, saving the processed data files.
+* **`environment.py`**: Defines the custom `MultiStrategyEnv` for our MARL agent, which includes the risk-aware reward function and structured observations.
+* **`train.py`**: The main training script. Implements hyperparameter tuning and uses an `EvalCallback` to find and save the best-performing model.
+* **`backtester.py`**: The evaluation script. Loads the final trained agent and evaluates its performance on the unseen test set against a benchmark.
+* **`news_fetcher.py`**: A utility script used to test the NewsAPI connection and key.
+* **`sentiment_pipeline.py`**: (On Hold) The script designed to fetch news and calculate sentiment scores. Currently on hold pending the EODHD data upgrade.
+* **`PROJECT_JOURNAL.md`**: This file. A log of our progress, architectural decisions, and next steps.
+
+---
+
+## 4. Current Status & Immediate Next Steps
+
+* **Last Action**: We are currently running a full training experiment (`python src/train.py`) using the new specialist agent architecture.
+* **Next Step**: Once the training is complete, the immediate next step is to **run the backtester** (`python src/backtester.py`) to analyze the performance of this newly trained agent.
+
+---
+
+## 5. Future Plans & Roadmap
+
+* **Data Upgrade**: The highest priority is to upgrade the data source to a paid **EODHD "All-in-One" subscription** to integrate professional-grade price, fundamental, and news/sentiment data.
+* **Infrastructure Upgrade**: To scale to the full U.S. market, we will migrate the workflow to the cloud, utilizing Cloud Storage, VMs, and GPUs.
+* **Live Trading**: The final phase is to transition from backtesting to live trading using **Interactive Brokers (IBKR)**, which will involve building a new `live_trader.py` script and a real-time tactical overlay for risk management.

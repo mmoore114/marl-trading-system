@@ -1,51 +1,54 @@
 import pandas as pd
 import numpy as np
 import yaml
-import joblib # For saving the HMM model
-from ta.momentum import rsi
+import joblib
+from ta.momentum import rsi, roc
 from ta.trend import macd, macd_signal, ema_indicator
-from ta.volatility import bollinger_hband, bollinger_lband, bollinger_pband, average_true_range
+from ta.volatility import bollinger_pband
 from ta.volume import on_balance_volume
 from hurst import compute_Hc
-from hmmlearn.hmm import GaussianHMM # HMM library
+from hmmlearn.hmm import GaussianHMM
 from pathlib import Path
 
 def calculate_factors(df, factor_config):
     """
-    Calculates technical analysis factors based on a configuration dictionary.
+    Calculates a wide range of factors based on the config file.
+    The factors are prefixed with their strategy group name.
     """
-    if factor_config.get('RSI', {}).get('enabled', False):
-        params = factor_config['RSI']
-        df['RSI'] = rsi(df['Close'], window=params.get('window', 14))
+    # --- Momentum Agent Factors ---
+    if factor_config.get('Momentum', {}):
+        mom_conf = factor_config['Momentum']
+        if mom_conf.get('RSI_14', {}).get('enabled'):
+            df['Momentum_RSI_14'] = rsi(df['Close'], window=mom_conf['RSI_14'].get('window', 14))
+        if mom_conf.get('MACD', {}).get('enabled'):
+            params = mom_conf['MACD']
+            df['Momentum_MACD'] = macd(df['Close'], window_fast=params.get('fast', 12), window_slow=params.get('slow', 26))
+        if mom_conf.get('EMA_Cross_50_200', {}).get('enabled'):
+            params = mom_conf['EMA_Cross_50_200']
+            ema_fast = ema_indicator(df['Close'], window=params.get('fast', 50))
+            ema_slow = ema_indicator(df['Close'], window=params.get('slow', 200))
+            df['Momentum_EMA_Cross'] = ema_fast - ema_slow
+        if mom_conf.get('ROC_21', {}).get('enabled'):
+            df['Momentum_ROC_21'] = roc(df['Close'], window=mom_conf['ROC_21'].get('window', 21))
 
-    # ... (the rest of your existing factor calculations remain the same) ...
-    if factor_config.get('MACD', {}).get('enabled', False):
-        params = factor_config['MACD']
-        df['MACD'] = macd(df['Close'], window_fast=params.get('fast', 12), window_slow=params.get('slow', 26))
-        df['MACD_signal'] = macd_signal(df['Close'], window_fast=params.get('fast', 12), window_slow=params.get('slow', 26), window_sign=params.get('signal', 9))
+    # --- Mean-Reversion Agent Factors ---
+    if factor_config.get('MeanReversion', {}):
+        mr_conf = factor_config['MeanReversion']
+        if mr_conf.get('BBands_Percent_20', {}).get('enabled'):
+            params = mr_conf['BBands_Percent_20']
+            df['MeanReversion_BBP'] = bollinger_pband(df['Close'], window=params.get('window', 20), window_dev=params.get('std', 2))
+        if mr_conf.get('RSI_Reversion_14', {}).get('enabled'):
+            # This can be the same calculation as momentum RSI, but its interpretation is different.
+            df['MeanReversion_RSI'] = rsi(df['Close'], window=mr_conf['RSI_Reversion_14'].get('window', 14))
 
-    if factor_config.get('EMA', {}).get('enabled', False):
-        params = factor_config['EMA']
-        for window in params.get('windows', []):
-            df[f'EMA_{window}'] = ema_indicator(df['Close'], window=window)
-
-    if factor_config.get('BBands', {}).get('enabled', False):
-        params = factor_config['BBands']
-        df['BB_upper'] = bollinger_hband(df['Close'], window=params.get('window', 20), window_dev=params.get('std', 2))
-        df['BB_lower'] = bollinger_lband(df['Close'], window=params.get('window', 20), window_dev=params.get('std', 2))
-        df['BB_percent'] = bollinger_pband(df['Close'], window=params.get('window', 20), window_dev=params.get('std', 2))
-
-    if factor_config.get('ATR', {}).get('enabled', False):
-        params = factor_config['ATR']
-        df['ATR'] = average_true_range(df['High'], df['Low'], df['Close'], window=params.get('window', 14))
-
-    if factor_config.get('OBV', {}).get('enabled', False):
-        df['OBV'] = on_balance_volume(df['Close'], df['Volume'])
-        
-    if factor_config.get('Hurst', {}).get('enabled', False):
-        params = factor_config['Hurst']
-        window = params.get('window', 252)
-        df['Hurst'] = df['Close'].rolling(window=window).apply(lambda x: compute_Hc(x)[0], raw=True)
+    # --- Shared Factors ---
+    if factor_config.get('Shared', {}):
+        shared_conf = factor_config['Shared']
+        if shared_conf.get('Volatility_21', {}).get('enabled'):
+            df['Shared_Volatility'] = df['Close'].pct_change().rolling(window=shared_conf['Volatility_21'].get('window', 21)).std()
+        if shared_conf.get('Hurst_252', {}).get('enabled'):
+            window = shared_conf['Hurst_252'].get('window', 252)
+            df['Shared_Hurst'] = df['Close'].rolling(window=window).apply(lambda x: compute_Hc(x)[0], raw=True)
 
     df.replace([np.inf, -np.inf], np.nan, inplace=True)
     df.dropna(inplace=True)
@@ -84,49 +87,34 @@ if __name__ == "__main__":
             df[col] = pd.to_numeric(df[col], errors='coerce')
         df.dropna(inplace=True)
 
-        # --- HMM REGIME DETECTION (NEW) ---
-        print(f"  Training HMM for {ticker}...")
+        df_factors = calculate_factors(df.copy(), FACTOR_CONFIG)
         
-        # 1. Prepare HMM features on the training set only
+        # HMM Regime Detection Logic remains the same
+        print(f"  Training HMM for {ticker}...")
         hmm_train_df = df[df.index <= TRAIN_END_DATE].copy()
         hmm_train_df['Log_Returns'] = np.log(hmm_train_df['Close'] / hmm_train_df['Close'].shift(1))
         hmm_train_df['Volatility'] = hmm_train_df['Log_Returns'].rolling(window=21).std()
         hmm_train_df.dropna(inplace=True)
         hmm_features = hmm_train_df[['Log_Returns', 'Volatility']].values
         
-        # 2. Train and save the HMM
         hmm = GaussianHMM(n_components=3, covariance_type="diag", n_iter=1000, random_state=42)
         hmm.fit(hmm_features)
         hmm_model_path = models_dir / f"hmm_model_{ticker}.pkl"
         joblib.dump(hmm, hmm_model_path)
-        print(f"  HMM model saved to {hmm_model_path}")
         
-        # --- CALCULATE ALL FACTORS ---
-        df_factors = calculate_factors(df.copy(), FACTOR_CONFIG)
-        
-        # --- PREDICT REGIME PROBABILITIES (NEW) ---
         print(f"  Predicting regime probabilities for {ticker}...")
-        
-        # 1. Prepare HMM features for the entire dataset
         full_hmm_features_df = df_factors[['Close']].copy()
         full_hmm_features_df['Log_Returns'] = np.log(full_hmm_features_df['Close'] / full_hmm_features_df['Close'].shift(1))
         full_hmm_features_df['Volatility'] = full_hmm_features_df['Log_Returns'].rolling(window=21).std()
         full_hmm_features_df.dropna(inplace=True)
         full_hmm_features = full_hmm_features_df[['Log_Returns', 'Volatility']].values
         
-        # 2. Predict probabilities using the trained model
         regime_probs = hmm.predict_proba(full_hmm_features)
         
-        # 3. Add probabilities to our main dataframe
-        # Create a temporary dataframe for the probabilities with the correct index
-        probs_df = pd.DataFrame(regime_probs, 
-                                index=full_hmm_features_df.index, 
-                                columns=[f'Regime_{i}_Prob' for i in range(hmm.n_components)])
+        probs_df = pd.DataFrame(regime_probs, index=full_hmm_features_df.index, columns=[f'Shared_Regime_{i}_Prob' for i in range(hmm.n_components)])
         
-        # Merge the probabilities back into our main factor dataframe
         processed_df = df_factors.join(probs_df, how='inner')
 
-        # --- SAVE FINAL DATA ---
         output_file = processed_data_dir / f"{ticker}_processed.csv"
         processed_df.to_csv(output_file)
         print(f"  Successfully processed and saved final features to {output_file}")
