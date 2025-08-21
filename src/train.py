@@ -37,7 +37,8 @@ best_model_path_during_run = None
 for lr in LEARNING_RATES:
     print(f"\n--- Training with Learning Rate: {lr} ---")
     
-    # --- Create Environments using gymnasium.make_vec ---
+    # --- Create Vectorized Environments ---
+    # This is the modern and correct way to create a vectorized environment
     train_env = gym.make_vec("MultiStrategyEnv-v0", n_envs=1, 
                            env_kwargs=dict(data_dict=data_dict, config=config, mode='train'))
     train_env = VecNormalize(train_env, norm_obs=True, norm_reward=False, clip_obs=10.)
@@ -53,7 +54,12 @@ for lr in LEARNING_RATES:
 
     # --- Create and Train Agent ---
     model = PPO("MultiInputPolicy", train_env, verbose=0, learning_rate=lr)
-    model.learn(total_timesteps=MODEL_SETTINGS.get('total_timesteps', 50000), callback=eval_callback, progress_bar=True)
+    
+    model.learn(
+        total_timesteps=MODEL_SETTINGS.get('total_timesteps', 50000), 
+        callback=eval_callback,
+        progress_bar=True
+    )
     
     eval_results = np.load(f"{log_dir}evaluations.npz")
     mean_reward = np.mean(eval_results['results'])
