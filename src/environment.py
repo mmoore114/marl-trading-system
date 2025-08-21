@@ -2,6 +2,21 @@ import gymnasium as gym
 import numpy as np
 import pandas as pd
 from gymnasium import spaces
+import yaml
+from gymnasium.envs.registration import register
+
+# --- Load Config (Only settings needed by the env) ---
+try:
+    with open("config.yaml", "r") as f:
+        config = yaml.safe_load(f)
+except FileNotFoundError:
+    print("Error: config.yaml not found.")
+    # Set defaults if config is not found, useful for simple testing
+    config = {
+        'environment_settings': {'initial_balance': 15000},
+        'reward_settings': {'drawdown_penalty': 0.2, 'turnover_penalty': 0.05},
+        'data_settings': {'train_end_date': '2022-12-31', 'val_end_date': '2023-12-31'}
+    }
 
 class MultiStrategyEnv(gym.Env):
     def __init__(self, data_dict, config, mode='train'):
@@ -21,7 +36,7 @@ class MultiStrategyEnv(gym.Env):
         self._prepare_data(data_dict)
         self._prepare_feature_groups()
         
-        # --- SPACES (NEW DICT-BASED APPROACH) ---
+        # --- Spaces (Dict-based observation) ---
         self.observation_space = spaces.Dict({
             agent_name: spaces.Box(low=-np.inf, high=np.inf, shape=(self.n_stocks, n_features), dtype=np.float32)
             for agent_name, n_features in self.features_per_agent.items()
@@ -57,6 +72,7 @@ class MultiStrategyEnv(gym.Env):
         self.features_per_agent = {}
         all_cols = self.df_dict[self.tickers[0]].columns
         
+        # Use the agent names from the factor_settings in the config file
         for agent_name in self.config['factor_settings'].keys():
             self.feature_groups[agent_name] = [col for col in all_cols if col.startswith(agent_name)]
             self.features_per_agent[agent_name] = len(self.feature_groups[agent_name])
@@ -65,8 +81,9 @@ class MultiStrategyEnv(gym.Env):
         """Constructs the dictionary observation for the current step."""
         obs = {}
         for agent_name, feature_list in self.feature_groups.items():
-            agent_obs = np.array([self.df_dict[ticker][feature_list].iloc[self.current_step].values for ticker in self.tickers])
-            obs[agent_name] = agent_obs.astype(np.float32)
+            if feature_list: # Ensure the list is not empty
+                agent_obs = np.array([self.df_dict[ticker][feature_list].iloc[self.current_step].values for ticker in self.tickers])
+                obs[agent_name] = agent_obs.astype(np.float32)
         return obs
 
     def _get_info(self):
@@ -112,12 +129,16 @@ class MultiStrategyEnv(gym.Env):
         self.current_step += 1
         terminated = self.current_step >= self.max_steps or self.portfolio_value <= 0
 
-        # Update portfolio weights for the next step info
         if self.portfolio_value > 0:
             new_asset_values = target_weights * self.portfolio_value
             self.portfolio_weights = np.insert(new_asset_values, 0, self.portfolio_value - np.sum(new_asset_values)) / self.portfolio_value
-        else: # Went bust
+        else:
             self.portfolio_weights = np.array([1.0] + [0.0] * self.n_stocks)
 
-
         return self._get_obs(), reward, terminated, False, self._get_info()
+
+# --- NEW: Register the environment with gymnasium ---
+register(
+    id='MultiStrategyEnv-v0',
+    entry_point='environment:MultiStrategyEnv',
+)

@@ -40,13 +40,16 @@ factor_settings:
     Volatility_21: { enabled: true, window: 21 }
     Hurst_252:     { enabled: true, window: 252 }
 
-## --------------------
+## -# --------------------
 # Model Settings
 # --------------------
 model_settings:
   # A list of learning rates to test
   learning_rates: [0.0003, 0.0001, 0.000025] 
   total_timesteps: 500000
+  # NEW: Hyperparameters for GPU performance
+  n_steps: 8192      # How many steps to run for each update (the "batch")
+  batch_size: 256    # The size of mini-batches for the update-------------------
 
 # --------------------
 # Environment Settings

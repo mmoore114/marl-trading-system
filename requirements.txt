@@ -1,9 +1,7 @@
 pandas
 numpy
 scikit-learn
-torch
 transformers
-stable-baselines3[extra]
 requests
 yfinance
 newsapi-python
