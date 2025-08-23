@@ -9,14 +9,13 @@ from typing import Dict, Any, List, Optional
 
 import pandas as pd
 import yaml
-
 import yfinance as yf
 
+# Optional .env support (safe even if no .env exists)
 try:
-    from dotenv import load_dotenv
+    from dotenv import load_dotenv  # type: ignore
 except Exception:  # pragma: no cover
     load_dotenv = None  # type: ignore
-
 
 CFG_PATH = Path("config.yaml")
 
@@ -32,43 +31,43 @@ def ensure_dir(p: Path) -> None:
 
 def _normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
     """
-    Make sure we end up with columns:
+    Ensure we end up with columns:
     ['date','open','high','low','close','adj_close','volume', ...]
     and that 'date' is a column (not an index). Handles MultiIndex outputs.
     """
-    # Reset index to expose date as a column (works whether index is Date/DatetimeIndex)
-    if df.index.name is not None or not isinstance(df.index, pd.RangeIndex):
+    # 1) Reset index so date is a column
+    if not isinstance(df.index, pd.RangeIndex):
         df = df.reset_index()
 
-    # Flatten potential MultiIndex columns
+    # 2) Flatten MultiIndex columns if present
     if isinstance(df.columns, pd.MultiIndex):
         df.columns = ["_".join([str(x) for x in tup if x]).strip() for tup in df.columns]
 
-    # Lowercase and replace spaces with underscores
+    # 3) Lowercase, underscore
     df.columns = [str(c).strip().lower().replace(" ", "_") for c in df.columns]
 
-    # Unify date column name
+    # 4) Standardize date column
     if "date" not in df.columns:
         if "datetime" in df.columns:
             df = df.rename(columns={"datetime": "date"})
         elif "index" in df.columns:
             df = df.rename(columns={"index": "date"})
+    if "date" in df.columns:
+        df["date"] = pd.to_datetime(df["date"])
 
-    # Unify adj close
+    # 5) Standardize adjusted close
+    # Common yfinance variants: 'adj_close', 'adj_close_(adjusted)', 'adjclose'
     if "adj_close" not in df.columns:
-        if "adj_close_(adjusted)" in df.columns:  # some odd providers
+        if "adj_close_(adjusted)" in df.columns:
             df = df.rename(columns={"adj_close_(adjusted)": "adj_close"})
         elif "adjclose" in df.columns:
             df = df.rename(columns={"adjclose": "adj_close"})
-        elif "adj_close" not in df.columns and "adj_close" not in df.columns and "adj_close" not in df.columns:
-            # yfinance often gives 'adj_close' or 'adj_close' via mapping above; else try 'adj_close' from 'adj_close' with space
-            if "adj_close" not in df.columns and "adj_close" not in df.columns and "adj_close" not in df.columns:
-                if "adj_close" not in df.columns and "adj_close" not in df.columns and "adj_close" not in df.columns:
-                    # as a final fallback, if only 'close' exists, duplicate it (not ideal but keeps pipeline running)
-                    if "close" in df.columns and "adj_close" not in df.columns:
-                        df["adj_close"] = df["close"]
+        elif "adj_close" not in df.columns:
+            # Fallback: if missing, duplicate 'close'
+            if "close" in df.columns:
+                df["adj_close"] = df["close"]
 
-    # Ensure required columns exist
+    # 6) Ensure required columns exist
     required = ["date", "open", "high", "low", "close", "adj_close", "volume"]
     for col in required:
         if col not in df.columns:
@@ -81,7 +80,7 @@ def _normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
 # PROTOTYPE: yfinance downloader
 # -----------------------------
 def download_yf(symbol: str, start: str, end: str, interval: str = "1d") -> pd.DataFrame:
-    # Ticker().history tends to be less quirky for single symbols
+    # Ticker().history is more predictable for single symbols than yf.download
     df = yf.Ticker(symbol).history(start=start, end=end, interval=interval, auto_adjust=False)
     if df is None or df.empty:
         return pd.DataFrame()
@@ -102,10 +101,15 @@ def _get_eodhd_key_from_env(env_name: str) -> Optional[str]:
 
 
 def download_eodhd(symbol: str, start: str, end: str, api_key: str, rate_limit_per_sec: float = 4.0) -> pd.DataFrame:
+    """
+    Minimal EODHD fetch (daily EOD).
+    When you upgrade to the All-in-One plan, we'll extend this to include fundamentals and sentiment.
+    """
     import requests
     from urllib.parse import urlencode
 
     base = "https://eodhd.com/api"
+    # Throttle between calls
     min_interval = 1.0 / max(rate_limit_per_sec, 1e-6)
     time.sleep(min_interval)
 
@@ -123,8 +127,7 @@ def download_eodhd(symbol: str, start: str, end: str, api_key: str, rate_limit_p
     if not rows:
         return pd.DataFrame()
 
-    df = pd.DataFrame(rows)
-    df = df.rename(
+    df = pd.DataFrame(rows).rename(
         columns={
             "date": "date",
             "open": "open",
@@ -135,5 +138,8 @@ def download_eodhd(symbol: str, start: str, end: str, api_key: str, rate_limit_p
             "volume": "volume",
         }
     )
-    df["symbol"] = symb
+    df["symbol"] = symbol
+    df["date"] = pd.to_datetime(df["date"])
+    cols = ["date", "open", "high", "low", "close", "adj_close", "volume", "symbol"]
+    return df[cols].sort_values("date")
 
