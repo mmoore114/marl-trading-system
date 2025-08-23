@@ -1,71 +1,57 @@
-# --------------------
-# Data Settings
-# --------------------
-data_settings:
-  # List of stock tickers to download and process
-  tickers: ['AAPL', 'MSFT', 'GOOGL', 'AMZN', 'TSLA', 'NVDA', 'META', 'JPM', 'PFE', 'XOM', 'PG', 'GE', 'DUK', 'DOW', 'SPG']
-  
-  # Date range for the entire dataset
-  start_date: "2010-01-01"
-  end_date: "2024-12-31"
+universe:
+  tickers: ["AAPL", "MSFT", "NVDA", "SPY"]
+  benchmark: "SPY"
 
-  # Defines the last day of the training data
-  train_end_date: '2022-12-31'
-  
-  # Defines the last day of the validation data
-  val_end_date: '2023-12-31'
+data:
+  start_date: "2018-01-01"
+  end_date: "2025-08-01"
+  price_frequency: "1d"
+  source: "yfinance"           # prototype mode; switch to "eodhd" later
 
-# --------------------
-# Factor Settings
-# --------------------
-# Defines the factors to be calculated and which agent they belong to.
-factor_settings:
-  # --- Momentum Agent Factors ---
-  # These factors measure the strength, direction, and persistence of trends.
-  Momentum:
-    RSI_14: { enabled: true, window: 14 }
-    MACD:   { enabled: true, fast: 12, slow: 26, signal: 9 }
-    EMA_Cross_50_200: { enabled: true, fast: 50, slow: 200 }
-    ROC_21: { enabled: true, window: 21 } # Rate of Change over 1 month
+eodhd:
+  api_key_env: "EODHD_API_KEY"
+  rate_limit_per_sec: 4.0
 
-  # --- Mean-Reversion Agent Factors ---
-  # These factors measure statistical deviation from a recent average.
-  MeanReversion:
-    BBands_Percent_20: { enabled: true, window: 20, std: 2 }
-    RSI_Reversion_14:  { enabled: true, window: 14 } # RSI used to find overbought/oversold
+splits:
+  train_end: "2023-12-31"
+  val_end: "2024-12-31"
 
-  # --- Shared Factors ---
-  # Factors that all agents might find useful for context.
-  Shared:
-    Volatility_21: { enabled: true, window: 21 }
-    Hurst_252:     { enabled: true, window: 252 }
+factors:
+  momentum_21d: {window: 21}
+  rsi_14: {window: 14}
+  vol_21d: {window: 21}
 
-## -# --------------------
-# Model Settings
-# --------------------
-model_settings:
-  # A list of learning rates to test
-  learning_rates: [0.0003, 0.0001, 0.000025] 
-  total_timesteps: 500000
-  # NEW: Hyperparameters for GPU performance
-  n_steps: 8192      # How many steps to run for each update (the "batch")
-  batch_size: 256    # The size of mini-batches for the update-------------------
+reward:
+  lambda_tc_bps: 1.0           # cost per 100% turnover
+  lambda_sigma: 0.10           # volatility penalty
+  lambda_dd: 0.05              # drawdown penalty
+  turnover_limit_bps: 1000
 
-# --------------------
-# Environment Settings
-# --------------------
-environment_settings:
-  initial_balance: 15000
-  risk_aversion: 0.3
-  lookback_period: 20
-  min_data_length: 25
+actions:
+  allow_short: false
+  max_weight_per_name: 0.10
+  cash_node: true
+
+training:
+  algo: "PPO"
+  total_timesteps: 150000
+  n_envs: 4
+  seed: 42
+  policy_kwargs:
+    net_arch:
+      pi: [128, 128]
+      vf: [128, 128]
+
+eval:
+  eval_episodes: 3
+  eval_freq_steps: 10000
+
+storage:
+  local_data_dir: "data"
+  gcs_bucket: ""
+
+logging:
+  use_mlflow: false
+  mlflow_uri: ""
 
 
-# --------------------
-# Reward Function Settings
-# --------------------
-reward_settings:
-  # Penalty for portfolio drawdown
-  drawdown_penalty: 0.2
-  # Penalty for high portfolio turnover (trading costs)
-  turnover_penalty: 0.05
