@@ -14,17 +14,17 @@ eodhd:
 
 splits:
   train_end: "2023-12-31"
-  val_end: "2024-12-31"
+  val_end:   "2024-12-31"
 
 factors:
   momentum_21d: {window: 21}
-  rsi_14: {window: 14}
-  vol_21d: {window: 21}
+  rsi_14:       {window: 14}
+  vol_21d:      {window: 21}
 
 reward:
   lambda_tc_bps: 1.0           # cost per 100% turnover
-  lambda_sigma: 0.10           # volatility penalty
-  lambda_dd: 0.05              # drawdown penalty
+  lambda_sigma:  0.10          # volatility penalty
+  lambda_dd:     0.05          # drawdown penalty
   turnover_limit_bps: 1000
 
 actions:
@@ -53,22 +53,7 @@ storage:
 logging:
   use_mlflow: false
   mlflow_uri: ""
-universe:
-  tickers:
-    - AAPL
-    - AMZN
-    - DOW
-    - DUK
-    - GE
-    - GOOGL
-    - JPM
-    - META
-    - MSFT
-    - NVDA
-    - PFE
-    - PG
-    - SPG
-    - TSLA
-    - XOM
+
+
 
 
