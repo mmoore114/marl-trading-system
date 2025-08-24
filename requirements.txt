@@ -1,19 +1,28 @@
+# /requirements.txt
+
+# Core ML/RL
+stable-baselines3[extra]
+torch
+
+# Data Handling & Analysis
 pandas
 numpy
 scikit-learn
-transformers
-requests
-yfinance
-newsapi-python
-jupyter
-matplotlib
-seaborn
-ta
-gymnasium
-quantstats
-tqdm
-PyYAML
-python-dotenv
-hurst
 statsmodels
+ta
+
+# Plotting & Reporting
+matplotlib
+quantstats
+
+# Config & Secrets
+pyyaml
+python-dotenv
+
+# Data Sources (Legacy)
+yfinance
+
+# Regime Detection
 hmmlearn
+pyarrow>=15.0.0
+
