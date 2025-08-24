@@ -1,145 +1,162 @@
 # src/data_pipeline.py
+"""
+Fetches raw OHLCV for all tickers in config.yaml (universe.tickers) plus the
+benchmark (universe.benchmark) using yfinance, and writes CSVs to data/raw.
+
+Run:
+    python -m src.data_pipeline
+"""
+
 from __future__ import annotations
-
-import json
-import os
-import time
 from pathlib import Path
-from typing import Dict, Any, List, Optional
-
+from typing import List, Tuple
 import pandas as pd
 import yaml
 import yfinance as yf
 
-# Optional .env support (safe even if no .env exists)
-try:
-    from dotenv import load_dotenv  # type: ignore
-except Exception:  # pragma: no cover
-    load_dotenv = None  # type: ignore
-
-CFG_PATH = Path("config.yaml")
+ROOT = Path(__file__).resolve().parents[1]
+CONFIG_FP = ROOT / "config.yaml"
+RAW_DIR = ROOT / "data" / "raw"
+RAW_DIR.mkdir(parents=True, exist_ok=True)
 
 
-def load_config() -> Dict[str, Any]:
-    with open(CFG_PATH, "r") as f:
-        return yaml.safe_load(f)
+def read_config() -> dict:
+    with open(CONFIG_FP, "r", encoding="utf-8") as f:
+        return yaml.safe_load(f) or {}
 
 
-def ensure_dir(p: Path) -> None:
-    p.mkdir(parents=True, exist_ok=True)
+def universe_and_benchmark(cfg: dict) -> Tuple[List[str], str]:
+    uni = cfg.get("universe", {}) or {}
+    tickers = [str(t).upper().strip() for t in (uni.get("tickers") or [])]
+    benchmark = str((uni.get("benchmark") or "SPY")).upper().strip()
+    if benchmark and benchmark not in tickers:
+        tickers.append(benchmark)
+    return tickers, benchmark
 
 
-def _normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Ensure we end up with columns:
-    ['date','open','high','low','close','adj_close','volume', ...]
-    and that 'date' is a column (not an index). Handles MultiIndex outputs.
-    """
-    # 1) Reset index so date is a column
-    if not isinstance(df.index, pd.RangeIndex):
-        df = df.reset_index()
+def date_range(cfg: dict) -> Tuple[str, str, str]:
+    data = cfg.get("data", {}) or {}
+    return (
+        str(data.get("start_date") or "2018-01-01"),
+        str(data.get("end_date") or "2025-08-01"),
+        str(data.get("price_frequency") or "1d"),
+    )
 
-    # 2) Flatten MultiIndex columns if present
+
+def _flatten_columns(df: pd.DataFrame) -> pd.DataFrame:
+    """Ensure simple string columns (no tuples/MultiIndex)."""
     if isinstance(df.columns, pd.MultiIndex):
-        df.columns = ["_".join([str(x) for x in tup if x]).strip() for tup in df.columns]
-
-    # 3) Lowercase, underscore
-    df.columns = [str(c).strip().lower().replace(" ", "_") for c in df.columns]
-
-    # 4) Standardize date column
-    if "date" not in df.columns:
-        if "datetime" in df.columns:
-            df = df.rename(columns={"datetime": "date"})
-        elif "index" in df.columns:
-            df = df.rename(columns={"index": "date"})
-    if "date" in df.columns:
-        df["date"] = pd.to_datetime(df["date"])
-
-    # 5) Standardize adjusted close
-    # Common yfinance variants: 'adj_close', 'adj_close_(adjusted)', 'adjclose'
-    if "adj_close" not in df.columns:
-        if "adj_close_(adjusted)" in df.columns:
-            df = df.rename(columns={"adj_close_(adjusted)": "adj_close"})
-        elif "adjclose" in df.columns:
-            df = df.rename(columns={"adjclose": "adj_close"})
-        elif "adj_close" not in df.columns:
-            # Fallback: if missing, duplicate 'close'
-            if "close" in df.columns:
-                df["adj_close"] = df["close"]
-
-    # 6) Ensure required columns exist
-    required = ["date", "open", "high", "low", "close", "adj_close", "volume"]
-    for col in required:
-        if col not in df.columns:
-            raise KeyError(f"Required column '{col}' missing after normalization. Columns: {list(df.columns)}")
-
+        df = df.copy()
+        df.columns = [c[0] if isinstance(c, tuple) else str(c) for c in df.columns]
+    else:
+        # Some yfinance versions still hand back tuples as column labels
+        df = df.copy()
+        df.columns = [c[0] if isinstance(c, tuple) else str(c) for c in df.columns]
     return df
 
 
-# -----------------------------
-# PROTOTYPE: yfinance downloader
-# -----------------------------
-def download_yf(symbol: str, start: str, end: str, interval: str = "1d") -> pd.DataFrame:
-    # Ticker().history is more predictable for single symbols than yf.download
-    df = yf.Ticker(symbol).history(start=start, end=end, interval=interval, auto_adjust=False)
-    if df is None or df.empty:
-        return pd.DataFrame()
+def download_one(ticker: str, start: str, end: str, interval: str) -> pd.DataFrame:
+    df = yf.download(
+        ticker,
+        start=start,
+        end=end,
+        interval=interval,
+        auto_adjust=False,
+        progress=False,
+        group_by="column",  # ask yfinance not to create symbol-level groups
+        threads=True,
+    )
+    if df is None or len(df) == 0:
+        raise RuntimeError(f"yfinance returned empty data for {ticker}")
 
-    df = _normalize_columns(df)
-    df["symbol"] = symbol
-    cols = ["date", "open", "high", "low", "close", "adj_close", "volume", "symbol"]
-    return df[cols].sort_values("date")
+    df = _flatten_columns(df)
 
+    # Normalize date column
+    if isinstance(df.index, pd.DatetimeIndex):
+        df = df.reset_index().rename(columns={"Date": "date"})
+    elif "Date" in df.columns:
+        df = df.rename(columns={"Date": "date"})
+    else:
+        # try to coerce the first column to date
+        first_col = df.columns[0]
+        df = df.rename(columns={first_col: "date"})
+    df["date"] = pd.to_datetime(df["date"], errors="coerce")
 
-# -----------------------------
-# FUTURE: EODHD downloader stub
-# -----------------------------
-def _get_eodhd_key_from_env(env_name: str) -> Optional[str]:
-    if load_dotenv:
-        load_dotenv()
-    return os.getenv(env_name)
+    # Build a case-insensitive column lookup
+    cmap = {str(c).lower(): c for c in df.columns}
 
+    def pick(name: str):
+        low = name.lower()
+        if low in cmap:
+            return df[cmap[low]]
+        # common alternates
+        alts = {
+            "open": ["open", "open*"],
+            "high": ["high"],
+            "low": ["low"],
+            "close": ["close"],
+            "volume": ["volume", "vol"],
+        }[low]
+        for a in alts:
+            if a in cmap:
+                return df[cmap[a]]
+        return pd.NA
 
-def download_eodhd(symbol: str, start: str, end: str, api_key: str, rate_limit_per_sec: float = 4.0) -> pd.DataFrame:
-    """
-    Minimal EODHD fetch (daily EOD).
-    When you upgrade to the All-in-One plan, we'll extend this to include fundamentals and sentiment.
-    """
-    import requests
-    from urllib.parse import urlencode
-
-    base = "https://eodhd.com/api"
-    # Throttle between calls
-    min_interval = 1.0 / max(rate_limit_per_sec, 1e-6)
-    time.sleep(min_interval)
-
-    params = {
-        "period": "d",
-        "from": start,
-        "to": end,
-        "api_token": api_key,
-        "fmt": "json",
-    }
-    url = f"{base}/eod/{symbol}.US?{urlencode(params)}"
-    r = requests.get(url, timeout=30)
-    r.raise_for_status()
-    rows: List[Dict[str, Any]] = r.json() or []
-    if not rows:
-        return pd.DataFrame()
-
-    df = pd.DataFrame(rows).rename(
-        columns={
-            "date": "date",
-            "open": "open",
-            "high": "high",
-            "low": "low",
-            "close": "close",
-            "adjusted_close": "adj_close",
-            "volume": "volume",
+    out = pd.DataFrame(
+        {
+            "date": df["date"],
+            "Open": pick("Open"),
+            "High": pick("High"),
+            "Low": pick("Low"),
+            "Close": pick("Close"),
+            "Volume": pick("Volume"),
         }
     )
-    df["symbol"] = symbol
-    df["date"] = pd.to_datetime(df["date"])
-    cols = ["date", "open", "high", "low", "close", "adj_close", "volume", "symbol"]
-    return df[cols].sort_values("date")
+
+    out = (
+        out.dropna(subset=["date"])
+        .sort_values("date")
+        .drop_duplicates(subset=["date"])
+        .reset_index(drop=True)
+    )
+    return out
+
+
+def run():
+    cfg = read_config()
+    tickers, benchmark = universe_and_benchmark(cfg)
+    start, end, freq = date_range(cfg)
+
+    print(f"[pipeline] start={start} end={end} freq={freq}")
+    print(f"[pipeline] tickers ({len(tickers)}): {tickers}")
+    print(f"[pipeline] benchmark: {benchmark}")
+
+    ok, fail = [], []
+    for t in tickers:
+        try:
+            print(f"[pipeline] Downloading {t} ...", end="", flush=True)
+            df = download_one(t, start, end, freq)
+            fp = RAW_DIR / f"{t}.csv"
+            df.to_csv(fp, index=False)
+            print(f" saved -> {fp}")
+            ok.append(t)
+        except Exception as e:
+            print(f" ERROR: {e}")
+            fail.append((t, str(e)))
+
+    print(f"[pipeline] Done. Success={len(ok)} Failures={len(fail)}")
+    if fail:
+        for t, msg in fail:
+            print(f"  - {t}: {msg}")
+        if benchmark and any(t == benchmark for t, _ in fail):
+            print("[pipeline] WARNING: Benchmark failed to download; "
+                  "backtests that expect it may fail until you re-run.")
+
+
+if __name__ == "__main__":
+    run()
+
+
+
+
 
