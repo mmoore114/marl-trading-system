@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Dict, List
+from typing import Dict, List, Tuple
 
 import gymnasium as gym
 import numpy as np
@@ -11,12 +11,37 @@ import yaml
 from gymnasium import spaces
 
 
+def _load_cfg(cfg_path: str = "config.yaml") -> dict:
+    with open(cfg_path, "r") as f:
+        return yaml.safe_load(f)
+
+
+def _load_processed_parquet(symbol: str, proc_dir: Path) -> pd.DataFrame:
+    """
+    Strict parquet loader for a single symbol.
+    Expects columns: date, ret_1d, spec_momentum, spec_meanrev
+    """
+    fp = proc_dir / f"{symbol}.parquet"
+    if not fp.exists():
+        raise FileNotFoundError(f"Missing {fp}. Run: python -m src.feature_engineering")
+    df = pd.read_parquet(fp)
+    # Normalize and sanity-check
+    df.columns = [str(c).lower() for c in df.columns]
+    need = {"date", "ret_1d", "spec_momentum", "spec_meanrev"}
+    missing = need - set(df.columns)
+    if missing:
+        raise KeyError(f"{fp} missing columns {missing}. Re-run feature_engineering.")
+    df["date"] = pd.to_datetime(df["date"], errors="coerce")
+    df = df.dropna(subset=["date"]).sort_values("date").reset_index(drop=True)
+    return df[["date", "ret_1d", "spec_momentum", "spec_meanrev"]].copy()
+
+
 class MultiStrategyEnv(gym.Env):
     """
-    Dictionary observations:
+    Dict observations (per day, aligned across symbols):
       {
-        "momentum":  [N],
-        "meanrev":   [N],
+        "momentum": [N],   # spec_momentum per symbol (ordered by self.symbols)
+        "meanrev":  [N],   # spec_meanrev per symbol
       }
 
     Action: weights over N assets (+ optional cash).
@@ -26,54 +51,28 @@ class MultiStrategyEnv(gym.Env):
 
     def __init__(self, cfg_path: str = "config.yaml", mode: str = "train"):
         super().__init__()
-        with open(cfg_path, "r") as f:
-            self.cfg = yaml.safe_load(f)
+        self.cfg = _load_cfg(cfg_path)
         self.mode = mode
 
+        # Paths
         self.data_dir = Path(self.cfg["storage"]["local_data_dir"])
         self.proc_dir = self.data_dir / "processed"
 
-        # ---- Load processed data (prefer parquet; fallback to *_processed.csv)
-        files = sorted(self.proc_dir.glob("*.parquet"))
-        if not files:
-            files = sorted(self.proc_dir.glob("*_processed.csv"))
-            if not files:
-                raise FileNotFoundError(
-                    f"No processed files found in {self.proc_dir}. "
-                    f"Run: python -m src.feature_engineering"
-                )
+        # Universe
+        self.symbols: List[str] = list(self.cfg["universe"]["tickers"])
+        if not self.symbols:
+            raise ValueError("No tickers in config.universe.tickers")
 
+        # Load all symbols (parquet only)
         frames: List[pd.DataFrame] = []
-        symbols: List[str] = []
-        for fp in files:
-            if fp.suffix.lower() == ".csv":
-                sym = fp.stem.replace("_processed", "")
-                df = pd.read_csv(fp)
-            else:
-                sym = fp.stem
-                df = pd.read_parquet(fp)
-
-            # Normalize basics
-            df.columns = [str(c).lower() for c in df.columns]
-            if "date" not in df.columns:
-                raise KeyError(f"'date' column missing in {fp}")
-            df["date"] = pd.to_datetime(df["date"], errors="coerce")
-
-            need_cols = {"ret_1d", "spec_momentum", "spec_meanrev"}
-            missing = need_cols - set(df.columns)
-            if missing:
-                raise KeyError(f"Missing columns {missing} in {fp}. Re-run feature_engineering.")
-
-            df = df[["date", "ret_1d", "spec_momentum", "spec_meanrev"]].copy()
+        for sym in self.symbols:
+            df = _load_processed_parquet(sym, self.proc_dir)
             df["symbol"] = sym
             frames.append(df)
-            symbols.append(sym)
-
-        self.symbols = sorted(symbols)
         panel = pd.concat(frames, ignore_index=True)
         panel = panel.sort_values(["date", "symbol"]).reset_index(drop=True)
 
-        # ---- Split by dates
+        # Date splits
         sd = pd.Timestamp(self.cfg["data"]["start_date"])
         td = pd.Timestamp(self.cfg["splits"]["train_end"])
         vd = pd.Timestamp(self.cfg["splits"]["val_end"])
@@ -83,25 +82,28 @@ class MultiStrategyEnv(gym.Env):
             mask = (panel["date"] >= sd) & (panel["date"] <= td)
         elif self.mode == "val":
             mask = (panel["date"] > td) & (panel["date"] <= vd)
-        else:
+        else:  # test
             mask = (panel["date"] > vd) & (panel["date"] <= ed)
 
-        self.df = panel[mask].copy()
+        df_split = panel[mask].copy()
 
-        # Ensure we have a full panel each day (align by intersection)
-        by_day = self.df.groupby("date")["symbol"].nunique()
+        # Keep only dates where ALL symbols are present (full panel)
+        by_day = df_split.groupby("date")["symbol"].nunique()
         full_days = by_day[by_day == len(self.symbols)].index
-        self.df = self.df[self.df["date"].isin(full_days)].copy()
+        self.df = df_split[df_split["date"].isin(full_days)].copy()
 
         self.dates = sorted(self.df["date"].unique())
-        if len(self.dates) < 3:
-            raise RuntimeError("Not enough dates in the selected split to run the environment.")
+        if len(self.dates) < 5:
+            raise RuntimeError(
+                f"Not enough dates in {self.mode} split ({len(self.dates)}). "
+                f"Check your splits in config.yaml or regenerate features."
+            )
 
         self.n_assets = len(self.symbols)
         self.allow_short = bool(self.cfg["actions"]["allow_short"])
         self.cash_node = bool(self.cfg["actions"]["cash_node"])
 
-        # Observation space
+        # Observation & action spaces
         obs_dim = self.n_assets
         self.observation_space = spaces.Dict(
             {
@@ -110,12 +112,11 @@ class MultiStrategyEnv(gym.Env):
             }
         )
 
-        # Action space (weights)
         low = -1.0 if self.allow_short else 0.0
         act_dim = self.n_assets + (1 if self.cash_node else 0)
         self.action_space = spaces.Box(low=low, high=1.0, shape=(act_dim,), dtype=np.float32)
 
-        # Pre-index by date for fast lookup
+        # Pre-index by date for fast step()
         self.panel_by_date: Dict[pd.Timestamp, pd.DataFrame] = {}
         for d in self.dates:
             self.panel_by_date[d] = (
@@ -138,7 +139,7 @@ class MultiStrategyEnv(gym.Env):
         if self.cash_node:
             self.prev_w[-1] = 1.0
 
-    # ------------- helpers
+    # -------- helpers
     def _obs(self, d: pd.Timestamp) -> Dict[str, np.ndarray]:
         panel = self.panel_by_date[d]
         return {
@@ -149,76 +150,28 @@ class MultiStrategyEnv(gym.Env):
     def _project(self, w: np.ndarray) -> np.ndarray:
         w = np.asarray(w, dtype=np.float32).copy()
 
-        # Clip per-name
-        name_cap = self.max_w_name
+        cap = self.max_w_name
         if self.cash_node:
-            asset_w = np.clip(w[:-1], -name_cap if self.allow_short else 0.0, name_cap)
+            asset_w = w[:-1]
         else:
-            asset_w = np.clip(w, -name_cap if self.allow_short else 0.0, name_cap)
+            asset_w = w
 
-        # Long-only projection (if required)
-        if not self.allow_short:
-            asset_w = np.clip(asset_w, 0.0, None)
+        # Per-name cap & shorting rules
+        lo = -cap if self.allow_short else 0.0
+        hi = cap
+        asset_w = np.clip(asset_w, lo, hi)
 
         # Normalize + cash node
         if self.cash_node:
-            total = float(asset_w.sum())
-            if total > 1.0:
-                asset_w /= total
+            if not self.allow_short:
+                asset_w = np.clip(asset_w, 0.0, None)
+            s = float(asset_w.sum())
+            if s > 1.0:
+                asset_w /= s
             cash = 1.0 - float(asset_w.sum())
             w = np.concatenate([asset_w, np.array([cash], dtype=np.float32)])
         else:
-            total = float(asset_w.sum())
-            if total > 0:
-                w = asset_w / total
-            else:
-                # fallback to equal weight
-                w = np.ones_like(asset_w, dtype=np.float32) / len(asset_w)
-        return w
+            s = float(asset_w.sum())
+            if s <= 0:
+                w = np.on
 
-    # ------------- gym api
-    def reset(self, *, seed: int | None = None, options: dict | None = None):
-        super().reset(seed=seed)
-        self.t = 0
-        self.portfolio_value = 1.0
-        self.peak_value = 1.0
-        self.prev_w = np.zeros(self.action_space.shape[0], dtype=np.float32)
-        if self.cash_node:
-            self.prev_w[-1] = 1.0
-        return self._obs(self.dates[self.t]), {}
-
-    def step(self, action: np.ndarray):
-        action = np.asarray(action, dtype=np.float32)
-        w = self._project(action)
-
-        d = self.dates[self.t]
-        panel = self.panel_by_date[d]
-        asset_rets = panel["ret_1d"].to_numpy(np.float32)
-
-        if self.cash_node:
-            asset_rets = np.concatenate([asset_rets, np.array([0.0], dtype=np.float32)])
-
-        # Turnover & costs
-        turnover = float(np.abs(w - self.prev_w).sum())
-        tc_cost = self.lambda_tc * turnover
-
-        # Portfolio return (pre-penalty)
-        port_ret = float((w * asset_rets).sum())
-
-        # Volatility proxy from cross-sectional dispersion
-        vol_pen = self.lambda_sigma * float(np.std(asset_rets))
-
-        # Update equity & drawdown
-        self.portfolio_value *= (1.0 + port_ret - tc_cost - vol_pen)
-        self.peak_value = max(self.peak_value, self.portfolio_value)
-        dd = (self.peak_value - self.portfolio_value) / self.peak_value
-        dd_pen = self.lambda_dd * float(dd)
-
-        reward = port_ret - tc_cost - vol_pen - dd_pen
-        self.prev_w = w
-
-        self.t += 1
-        terminated = self.t >= (len(self.dates) - 1)
-        truncated = False
-        info = {"turnover": turnover, "tc_cost": tc_cost, "dd": float(dd), "port_ret": port_ret}
-        return (self._obs(self.dates[min(self.t, len(self.dates) - 1)]), reward, terminated, truncated, info)
