@@ -1,94 +1,82 @@
-import pandas as pd
-import quantstats as qs
-import matplotlib.pyplot as plt
-import yaml
+# src/backtester.py
+from __future__ import annotations
+
 from pathlib import Path
+from typing import Dict, List
+
+import numpy as np
+import pandas as pd
+import yaml
 from stable_baselines3 import PPO
-from stable_baselines3.common.vec_env import DummyVecEnv, VecNormalize
 
-from environment import MultiStrategyEnv
+from src.environment import MultiStrategyEnv
 
-# --- 1. Load Configuration ---
-try:
+
+def perf(returns: pd.Series) -> Dict[str, float]:
+    returns = returns.fillna(0.0)
+    cum = (1 + returns).cumprod()
+    n = len(returns)
+    if n == 0:
+        return dict(CAGR=np.nan, Sharpe=np.nan, Sortino=np.nan, MaxDD=np.nan, Calmar=np.nan)
+    cagr = cum.iloc[-1] ** (252 / n) - 1.0
+    sharpe = (returns.mean() / (returns.std() + 1e-12)) * np.sqrt(252)
+    downside = returns[returns < 0].std() + 1e-12
+    sortino = (returns.mean() / downside) * np.sqrt(252)
+    dd = ((cum.cummax() - cum) / cum.cummax()).max()
+    calmar = np.nan if dd == 0 else cagr / dd
+    return dict(CAGR=cagr, Sharpe=sharpe, Sortino=sortino, MaxDD=dd, Calmar=calmar)
+
+
+def run():
+    # Load config for baseline data
     with open("config.yaml", "r") as f:
-        config = yaml.safe_load(f)
-    TICKERS = config['data_settings']['tickers']
-    INITIAL_BALANCE = config['environment_settings']['initial_balance']
-except (FileNotFoundError, KeyError) as e:
-    print(f"Error loading configuration: {e}")
-    exit()
+        cfg = yaml.safe_load(f)
+    proc_dir = Path(cfg["storage"]["local_data_dir"]) / "processed"
 
-# --- 2. Define Paths ---
-processed_data_dir = Path("data/processed")
-model_path = Path("models/ppo_multi_strategy_final.zip")
-stats_path = Path("models/multi_strategy_vec_normalize.pkl")
+    # Agent env (test split)
+    env = MultiStrategyEnv(mode="test")
+    model = PPO.load("models/ppo_specialist_super_agent_final.zip")
 
-# --- 3. Load All Data ---
-print("Loading data for backtest...")
-data_dict = {}
-for ticker in TICKERS:
-    file_path = processed_data_dir / f"{ticker}_processed.csv"
-    data_dict[ticker] = pd.read_csv(file_path, index_col='Date', parse_dates=True)
+    obs, _ = env.reset()
+    done = False
+    rewards: List[float] = []
+    dates: List[pd.Timestamp] = []
 
-# --- 4. Create Test Environment ---
-print("Creating test environment...")
-test_env_lambda = lambda: MultiStrategyEnv(data_dict, config, mode='test')
-test_env = DummyVecEnv([test_env_lambda])
-test_env = VecNormalize.load(stats_path, test_env)
-test_env.training = False
-test_env.norm_reward = False
+    # Roll out through test period
+    while not done:
+        action, _state = model.predict(obs, deterministic=True)
+        obs, reward, terminated, truncated, info = env.step(action)
+        rewards.append(float(reward))
+        dates.append(env.dates[env.t - 1])
+        done = bool(terminated or truncated)
 
-# --- 5. Load the Trained Agent ---
-print("Loading trained agent...")
-model = PPO.load(model_path, env=test_env)
+    agent_ret = pd.Series(rewards, index=pd.Index(dates, name="date"))
 
-# --- 6. Run the Backtest ---
-print("Running backtest on unseen test data...")
-obs = test_env.reset()
-account_values_agent = [INITIAL_BALANCE]
-terminated = False
-while not terminated:
-    action, _states = model.predict(obs, deterministic=True)
-    obs, rewards, dones, infos = test_env.step(action)
-    account_values_agent.append(infos[0]['portfolio_value'])
-    terminated = dones[0]
+    # Build equal-weight baseline from processed panel on test dates
+    frames = []
+    for fp in sorted(proc_dir.glob("*.parquet")):
+        df = pd.read_parquet(fp, columns=["date", "ret_1d"]).assign(symbol=fp.stem)
+        frames.append(df)
+    if not frames:
+        # Fallback to *_processed.csv if no parquet present
+        for fp in sorted(proc_dir.glob("*_processed.csv")):
+            df = pd.read_csv(fp, usecols=["date", "ret_1d"]).assign(symbol=fp.stem.replace("_processed", ""))
+            frames.append(df)
+    panel = pd.concat(frames, ignore_index=True)
+    panel["date"] = pd.to_datetime(panel["date"])
+    panel = panel[panel["date"].isin(agent_ret.index)]
+    ew = panel.groupby("date")["ret_1d"].mean().reindex(agent_ret.index).fillna(0.0)
 
-# --- 7. Calculate Benchmark Performance ---
-print("Calculating benchmark performance...")
-test_start_date = config['data_settings']['val_end_date']
-close_prices_df = pd.DataFrame({ticker: df['Close'] for ticker, df in data_dict.items()})
-test_prices_df = close_prices_df[close_prices_df.index > test_start_date]
-daily_returns = test_prices_df.pct_change().dropna()
-benchmark_daily_returns = daily_returns.mean(axis=1)
+    # Metrics
+    tbl = pd.DataFrame(
+        {
+            "Metric": ["CAGR", "Sharpe", "Sortino", "MaxDD", "Calmar"],
+            "Agent": list(perf(agent_ret).values()),
+            "EqualWeight": list(perf(ew).values()),
+        }
+    )
+    print(tbl.to_string(index=False))
 
-# --- THE FIX: Give the benchmark Series a name ---
-benchmark_daily_returns.name = "Equal-Weight Benchmark"
 
-# Calculate the benchmark equity curve
-benchmark_cumulative_returns = (1 + benchmark_daily_returns).cumprod()
-benchmark_values = INITIAL_BALANCE * benchmark_cumulative_returns
-benchmark_values.iloc[0] = INITIAL_BALANCE
-
-# --- 8. Quantitative Analysis & Visualization ---
-print("\n--- Final Performance Analysis ---")
-test_dates = test_prices_df.index
-portfolio_values_agent = pd.Series(account_values_agent, index=test_dates[:len(account_values_agent)])
-agent_returns = portfolio_values_agent.pct_change().dropna()
-agent_returns.name = "Agent Strategy" # Also good practice to name the agent's returns
-
-report_path = "final_performance_report.html"
-qs.reports.html(agent_returns, benchmark=benchmark_daily_returns, output=report_path, title='Super-Agent vs. Benchmark')
-print(f"Full performance report saved to: {report_path}")
-
-print("\nPlotting performance...")
-plt.figure(figsize=(15, 7))
-plt.plot(portfolio_values_agent, label='Agent Strategy')
-plt.plot(benchmark_values, label='Buy and Hold Benchmark', linestyle='--')
-plt.title("Agent vs. Buy-and-Hold Benchmark on Test Data")
-plt.xlabel("Date")
-plt.ylabel("Portfolio Value (USD)")
-plt.legend()
-plt.grid(True)
-plt.show()
-
-print("\nBacktest complete.")
+if __name__ == "__main__":
+    run()
