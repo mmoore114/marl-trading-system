@@ -1,28 +1,24 @@
-# /requirements.txt
+# RL core
+stable-baselines3>=2.2.1,<3.0
+torch>=2.1.0
 
-# Core ML/RL
-stable-baselines3[extra]
-torch
+# Gym API used by the env
+gym==0.26.2
+cloudpickle>=2.2.1
+gym-notices>=0.0.8
 
-# Data Handling & Analysis
-pandas
-numpy
-scikit-learn
-statsmodels
-ta
+# Data + features
+pandas>=2.0
+numpy>=1.24
+pyyaml>=6.0
+yfinance>=0.2.40
 
-# Plotting & Reporting
-matplotlib
-quantstats
-
-# Config & Secrets
-pyyaml
-python-dotenv
-
-# Data Sources (Legacy)
-yfinance
-
-# Regime Detection
-hmmlearn
+# Parquet (fast + reliable)
 pyarrow>=15.0.0
+
+# Backtest reporting
+quantstats>=0.0.62
+matplotlib>=3.7
+scipy>=1.10
+
 

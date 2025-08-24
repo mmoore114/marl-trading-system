@@ -1,0 +1,9 @@
+MARL PPO Backtest Summary
+=========================
+Bars:          144
+Start:         2025-01-02
+End:           2025-07-31
+Total Return:  -5.4060%
+Ann. Vol:      5.1001%
+Sharpe~:       -1.88
+Max Drawdown:  7.0241%

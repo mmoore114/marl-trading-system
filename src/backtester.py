@@ -1,124 +1,108 @@
-# src/backtester.py
-from __future__ import annotations
-
-from pathlib import Path
 import os
 import numpy as np
 import pandas as pd
-
+import yaml
 from stable_baselines3 import PPO
 
-from src.environment import MultiStrategyEnv
+from src.environment import MultiStrategyEnv, PROC_DIR
 
+def read_config():
+    with open("config.yaml", "r") as f:
+        return yaml.safe_load(f)
+
+def _load_px(sym: str) -> pd.DataFrame:
+    fp = os.path.join(PROC_DIR, f"{sym}.parquet")
+    if not os.path.exists(fp):
+        raise FileNotFoundError(fp)
+    df = pd.read_parquet(fp)
+    df["date"] = pd.to_datetime(df["date"])
+    return df.sort_values("date")
+
+def equity_from_returns(r: np.ndarray, start=1.0) -> np.ndarray:
+    eq = np.cumprod(1.0 + np.nan_to_num(r, nan=0.0)) * start
+    return eq
+
+def summary_stats(equity: pd.Series):
+    ret = equity.pct_change().fillna(0.0)
+    total_return = equity.iloc[-1] / equity.iloc[0] - 1.0
+    ann_vol = ret.std() * np.sqrt(252.0)
+    sharpe = (ret.mean() * 252.0) / (ann_vol + 1e-12)
+    roll_max = equity.cummax()
+    dd = 1.0 - (equity / (roll_max + 1e-12))
+    mdd = dd.max()
+    return total_return, ann_vol, sharpe, mdd
 
 def run():
-    models_dir = Path("models")
-    reports_dir = Path("reports")
-    reports_dir.mkdir(parents=True, exist_ok=True)
-
-    model_path = models_dir / "ppo_specialist_super_agent_final.zip"
-    if not model_path.exists():
+    cfg = read_config()
+    model_path = os.path.join("models", "ppo_specialist_super_agent_final.zip")
+    if not os.path.exists(model_path):
         raise FileNotFoundError(f"{model_path} not found. Run training first.")
 
-    # Create test env (single env is fine for evaluation)
     env = MultiStrategyEnv(mode="test")
+    model = PPO.load(model_path)
 
-    # Load trained policy
-    model = PPO.load(model_path, device="cpu")  # swap to 'cuda' later on GCP if desired
-
-    obs, _info = env.reset()
+    obs = env.reset()
+    agent_rets = []
+    dates = []
     done = False
-    equity = [float(env.portfolio_value)]
-    t_idx = 0
-
-    # We’ll keep the actual trading dates from env
-    dates = [env.dates[0]]
-
     while not done:
-        # Deterministic policy during evaluation
-        action, _state = model.predict(obs, deterministic=True)
-        obs, reward, terminated, truncated, info = env.step(action)
+        action, _ = model.predict(obs, deterministic=True)
+        obs, reward, done, info = env.step(action)
+        agent_rets.append(info["port_ret"])
+        dates.append(pd.to_datetime(env.dates[env.t]))
 
-        # Track equity curve & date
-        equity.append(float(env.portfolio_value))
-        t_idx = min(env.t, len(env.dates) - 1)
-        dates.append(env.dates[t_idx])
+    # Agent equity
+    agent_eq = equity_from_returns(np.array(agent_rets), start=1.0)
 
-        done = bool(terminated or truncated)
+    # Bench equity (SPY)
+    bench_px = _load_px(cfg["universe"]["benchmark"])["adj_close"]
+    bench_px = bench_px[bench_px.index.isin(pd.Index(np.arange(len(bench_px))))]  # keep as-is
+    # align by dates used in env
+    bench_df = _load_px(cfg["universe"]["benchmark"])
+    bench_df = bench_df[bench_df["date"].isin(env.dates)].reset_index(drop=True)
+    bench_eq = bench_df["adj_close"] / bench_df["adj_close"].iloc[0]
 
-    # Build results frame
-    equity = np.array(equity, dtype=np.float64)
-    res = pd.DataFrame(
-        {
-            "date": pd.to_datetime(dates),
-            "equity": equity,
-        }
-    ).drop_duplicates(subset=["date"]).set_index("date").sort_index()
+    # Equal-weight baseline on universe
+    # Build returns aligned to env.dates
+    uni = cfg["universe"]["tickers"]
+    mats = []
+    for sym in uni:
+        df = _load_px(sym)
+        df = df[df["date"].isin(env.dates)].reset_index(drop=True)
+        r = df["adj_close"].pct_change().fillna(0.0).values
+        mats.append(r)
+    mats = np.array(mats)  # shape (A, T)
+    ew_ret = mats.mean(axis=0)
+    ew_eq = equity_from_returns(ew_ret, start=1.0)
 
-    res["ret"] = res["equity"].pct_change().fillna(0.0)
+    # Build report frame
+    out_dates = pd.Series(env.dates[1:1+len(agent_eq)], name="date")
+    rpt = pd.DataFrame({
+        "date": out_dates,
+        "agent": agent_eq,
+        "equal_weight": ew_eq[:len(agent_eq)],
+        "benchmark": bench_eq.values[:len(agent_eq)],
+    })
+    os.makedirs("reports", exist_ok=True)
+    csv_path = os.path.join("reports", "backtest_equity_curve.csv")
+    rpt.to_csv(csv_path, index=False)
+    print(f"[backtest] Saved equity curve -> {csv_path}")
 
-    # Save CSVs
-    out_csv = reports_dir / "backtest_equity_curve.csv"
-    res.to_csv(out_csv, index=True)
-    print(f"[backtest] Saved equity curve -> {out_csv}")
-
-    # Basic summary stats
-    total_return = float(res["equity"].iloc[-1] / max(res["equity"].iloc[0], 1e-12) - 1.0)
-    ann_factor = 252  # daily bars
-    vol = float(res["ret"].std() * np.sqrt(ann_factor))
-    sharpe = float((res["ret"].mean() * ann_factor) / vol) if vol > 0 else 0.0
-    max_dd = 0.0
-    if len(res) > 0:
-        running_max = res["equity"].cummax()
-        dd = (running_max - res["equity"]) / running_max.replace(0, np.nan)
-        max_dd = float(dd.max(skipna=True))
-
+    # Summary
+    a_tr, a_vol, a_sh, a_mdd = summary_stats(rpt["agent"])
     print("[backtest] Summary")
-    print(f"  Total Return: {total_return: .2%}")
-    print(f"  Ann. Vol:     {vol: .2%}")
-    print(f"  Sharpe~:      {sharpe: .2f}")
-    print(f"  Max Drawdown: {max_dd: .2%}")
+    print(f"  Total Return: {a_tr*100:.2f}%")
+    print(f"  Ann. Vol:      {a_vol*100:.2f}%")
+    print(f"  Sharpe~:      {a_sh:.2f}")
+    print(f"  Max Drawdown:  {a_mdd*100:.2f}%")
 
-    # Optional: QuantStats HTML report
-    try:
-        import quantstats as qs
-
-        # Quantstats expects a return series indexed by date
-        ret_ser = res["ret"].copy()
-        ret_ser.index = pd.to_datetime(ret_ser.index)
-
-        html_path = reports_dir / "quantstats_report.html"
-        # silent=True to avoid opening a browser; title shows ticker universe size
-        qs.reports.html(
-            ret_ser,
-            output=html_path.as_posix(),
-            title=f"MARL PPO Backtest (N={env.n_assets})",
-            compounded=True,
-            download_filename=html_path.name,
-            benchmark=None,  # could add SPY ret series later
-            rf=0.0,
-            grayscale=True,
-            figfmt="svg",
-            template="template.html" if (reports_dir / "template.html").exists() else None,
-        )
-        print(f"[backtest] Saved QuantStats report -> {html_path}")
-    except Exception as e:
-        print(f"[backtest] QuantStats report skipped: {e}")
-
-    # Also drop a simple TXT summary
-    summary_txt = reports_dir / "summary.txt"
-    with open(summary_txt, "w") as f:
-        f.write("MARL PPO Backtest Summary\n")
-        f.write("=========================\n")
-        f.write(f"Bars:          {len(res)}\n")
-        f.write(f"Start:         {res.index[0].date() if len(res) else 'n/a'}\n")
-        f.write(f"End:           {res.index[-1].date() if len(res) else 'n/a'}\n")
-        f.write(f"Total Return:  {total_return:.4%}\n")
-        f.write(f"Ann. Vol:      {vol:.4%}\n")
-        f.write(f"Sharpe~:       {sharpe:.2f}\n")
-        f.write(f"Max Drawdown:  {max_dd:.4%}\n")
-    print(f"[backtest] Saved summary -> {summary_txt}")
-
+    with open(os.path.join("reports","summary.txt"), "w") as f:
+        f.write("Agent (test split)\n")
+        f.write(f"Total Return: {a_tr*100:.2f}%\n")
+        f.write(f"Ann. Vol:     {a_vol*100:.2f}%\n")
+        f.write(f"Sharpe~:      {a_sh:.2f}\n")
+        f.write(f"Max DD:       {a_mdd*100:.2f}%\n")
+    print("[backtest] Saved summary -> reports\\summary.txt")
 
 if __name__ == "__main__":
     run()

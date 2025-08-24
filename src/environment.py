@@ -1,251 +1,264 @@
-# src/environment.py
-from __future__ import annotations
-
-from pathlib import Path
-from typing import Dict, List, Tuple
-
-import gymnasium as gym
+import os
+import gym
 import numpy as np
 import pandas as pd
 import yaml
-from gymnasium import spaces
+from gym import spaces
+from datetime import datetime
 
+PROC_DIR = os.path.join("data", "processed")
 
-def _load_cfg(cfg_path: str = "config.yaml") -> dict:
-    with open(cfg_path, "r") as f:
+def read_config():
+    with open("config.yaml", "r") as f:
         return yaml.safe_load(f)
 
-
-def _load_processed_parquet(symbol: str, proc_dir: Path) -> pd.DataFrame:
-    fp = proc_dir / f"{symbol}.parquet"
-    if not fp.exists():
+def _load_parquet(symbol: str, proc_dir: str) -> pd.DataFrame:
+    fp = os.path.join(proc_dir, f"{symbol}.parquet")
+    if not os.path.exists(fp):
         raise FileNotFoundError(f"Missing {fp}. Run: python -m src.feature_engineering")
     df = pd.read_parquet(fp)
-    df.columns = [str(c).lower() for c in df.columns]
-    need = {"date", "ret_1d", "spec_momentum", "spec_meanrev"}
-    missing = need - set(df.columns)
-    if missing:
-        raise KeyError(f"{fp} missing columns {missing}. Re-run feature_engineering.")
-    df["date"] = pd.to_datetime(df["date"], errors="coerce")
-    df = df.dropna(subset=["date"]).sort_values("date").reset_index(drop=True)
-    # Sanitize
-    for c in ["ret_1d", "spec_momentum", "spec_meanrev"]:
-        df[c] = pd.to_numeric(df[c], errors="coerce").replace([np.inf, -np.inf], np.nan).fillna(0.0)
-    return df[["date", "ret_1d", "spec_momentum", "spec_meanrev"]].copy()
+    if "date" not in df.columns:
+        raise ValueError(f"{symbol}.parquet missing 'date'")
+    df["date"] = pd.to_datetime(df["date"])
+    return df.sort_values("date").reset_index(drop=True)
 
+def _split_dates(cfg):
+    start = pd.to_datetime(cfg["data"]["start_date"])
+    end   = pd.to_datetime(cfg["data"]["end_date"])
+    tr_e  = pd.to_datetime(cfg["splits"]["train_end"])
+    va_e  = pd.to_datetime(cfg["splits"]["val_end"])
+    return start, tr_e, va_e, end
+
+def _safe_zscore(train_vals: np.ndarray, full_vals: np.ndarray):
+    mean = np.nanmean(train_vals, axis=0)
+    std  = np.nanstd(train_vals, axis=0)
+    std  = np.where(std < 1e-8, 1.0, std)
+    def z(x): return (x - mean) / std
+    return z(full_vals), mean, std
 
 class MultiStrategyEnv(gym.Env):
-    """
-    Dict observations:
-      {
-        "momentum": [N],
-        "meanrev":  [N],
-      }
-    Action: weights over N assets (+ optional cash).
-    Reward: portfolio return - costs - penalties.
-    """
-    metadata = {"render_modes": []}
+    metadata = {"render.modes": []}
 
-    def __init__(self, cfg_path: str = "config.yaml", mode: str = "train"):
+    def __init__(self, mode: str = "train"):
         super().__init__()
-        self.cfg = _load_cfg(cfg_path)
-        self.mode = mode  # requested mode (may change after fallback)
+        self.cfg = read_config()
+        self.proc_dir = PROC_DIR
+        uni = self.cfg["universe"]
 
-        # ---- placeholder spaces so SB3 can seed immediately
-        self.n_assets = 1
-        self.allow_short = False
-        self.cash_node = False
-        self.observation_space = spaces.Dict(
-            {
-                "momentum": spaces.Box(low=-np.inf, high=np.inf, shape=(1,), dtype=np.float32),
-                "meanrev": spaces.Box(low=-np.inf, high=np.inf, shape=(1,), dtype=np.float32),
-            }
-        )
-        self.action_space = spaces.Box(low=0.0, high=1.0, shape=(1,), dtype=np.float32)
+        self.tickers = list(dict.fromkeys(uni["tickers"]))  # preserve order, dedupe
+        self.benchmark = uni.get("benchmark", "SPY")
 
-        # bookkeeping placeholders
-        self.t = 0
-        self.portfolio_value = 1.0
-        self.peak_value = 1.0
-        self.prev_w = np.zeros(self.action_space.shape[0], dtype=np.float32)
+        # placeholder spaces for SB3 seeding
+        self.n_assets = max(1, len(self.tickers))
+        self.n_features = 8  # placeholder until we load real features
+        self.action_space = spaces.Box(low=-1.0, high=1.0, shape=(self.n_assets,), dtype=np.float32)
+        self.observation_space = spaces.Box(low=-10, high=10, shape=(self.n_assets, self.n_features), dtype=np.float32)
 
-        # paths
-        self.data_dir = Path(self.cfg["storage"]["local_data_dir"])
-        self.proc_dir = self.data_dir / "processed"
+        # Load data
+        self.data = {sym: _load_parquet(sym, self.proc_dir) for sym in self.tickers}
+        # Benchmark (ensure present even if not in tickers)
+        try:
+            self.bench_df = _load_parquet(self.benchmark, self.proc_dir)
+        except Exception:
+            # fallback: if benchmark missing, synth zero-ret series on market dates
+            dates = self._align_dates(list(self.data.values()))
+            self.bench_df = pd.DataFrame({"date": dates, "adj_close": 1.0})
+            self.bench_df["ret_1d"] = 0.0
 
-        # universe
-        self.symbols: List[str] = list(self.cfg["universe"]["tickers"])
-        if not self.symbols:
-            raise ValueError("No tickers in config.universe.tickers")
+        # Align dates across all assets & benchmark
+        all_frames = list(self.data.values()) + [self.bench_df]
+        self.dates = self._align_dates(all_frames)
 
-        # load panel
-        frames: List[pd.DataFrame] = []
-        for sym in self.symbols:
-            df = _load_processed_parquet(sym, self.proc_dir)
-            df["symbol"] = sym
-            frames.append(df)
-        panel = pd.concat(frames, ignore_index=True).sort_values(["date", "symbol"]).reset_index(drop=True)
+        # Reindex all on common dates, forward-fill and drop remaining NaNs
+        for k in list(self.data.keys()):
+            self.data[k] = self._reindex_one(self.data[k], self.dates)
+        self.bench_df = self._reindex_one(self.bench_df, self.dates)
 
-        # date bounds
-        sd = pd.Timestamp(self.cfg["data"]["start_date"])
-        td = pd.Timestamp(self.cfg["splits"]["train_end"])
-        vd = pd.Timestamp(self.cfg["splits"]["val_end"])
-        ed = pd.Timestamp(self.cfg["data"]["end_date"])
+        # Compute factor matrix per asset (use all non-price engineered columns as factors)
+        self.price_cols = ["open", "high", "low", "close", "volume", "adj_close"]
+        # factors are everything except date + price cols
+        sample_df = next(iter(self.data.values()))
+        self.factor_cols = [c for c in sample_df.columns if c not in (["date"] + self.price_cols)]
+        if not self.factor_cols:
+            # fallback to minimal features: 1d return only
+            self.factor_cols = ["ret_1d"]
 
-        def _mask_for(m: str) -> pd.Series:
-            if m == "train":
-                return (panel["date"] >= sd) & (panel["date"] <= td)
-            if m == "val":
-                return (panel["date"] > td) & (panel["date"] <= vd)
-            # test
-            return (panel["date"] > vd) & (panel["date"] <= ed)
+        # Build 3D tensor: (time, assets, factors)
+        self.X = self._build_panel(self.factor_cols)
+        # Standardize using TRAIN stats only
+        start, train_end, val_end, end = _split_dates(self.cfg)
+        t_idx = (self.dates <= train_end)
+        Xz, self.mu, self.sigma = _safe_zscore(self.X[t_idx].reshape((-1, len(self.factor_cols))),
+                                               self.X.reshape((-1, len(self.factor_cols))))
+        self.Xz = Xz.reshape(self.X.shape)
 
-        # try requested mode, then fallbacks
-        tried = []
-        for candidate in [mode, "val", "train"]:
-            if candidate in tried:
-                continue
-            tried.append(candidate)
-            df_split = panel[_mask_for(candidate)].copy()
-            # keep only full panel days
-            by_day = df_split.groupby("date")["symbol"].nunique()
-            full_days = by_day[by_day == len(self.symbols)].index
-            df_candidate = df_split[df_split["date"].isin(full_days)].copy()
-            dates = sorted(df_candidate["date"].unique())
-            if len(dates) >= 5:
-                # accept this split
-                self.mode = candidate
-                self.df = df_candidate
-                self.dates = dates
-                if candidate != mode:
-                    print(f"[env] Requested mode '{mode}' had no data. Falling back to '{candidate}'.")
-                break
-        else:
-            raise RuntimeError(
-                "Not enough dates in any split (train/val/test). "
-                "Adjust splits in config.yaml or regenerate features to extend the date range."
-            )
+        # Daily returns per asset (use adj_close)
+        self.R = self._build_returns()  # shape (time, assets)
+        # Benchmark returns aligned
+        self.bench_ret = self._series_ret(self.bench_df["adj_close"].values)
 
-        # set final spaces now that dimensions are known
-        self.n_assets = len(self.symbols)
-        self.allow_short = bool(self.cfg["actions"]["allow_short"])
-        self.cash_node = bool(self.cfg["actions"]["cash_node"])
+        # Splits
+        self.split_idx = {
+            "train": (self.dates <= train_end),
+            "val":   (self.dates > train_end) & (self.dates <= val_end),
+            "test":  (self.dates > val_end) & (self.dates <= end),
+        }
+        self.mode = self._resolve_mode(mode)
+        self.idx = np.where(self.split_idx[self.mode])[0]
+        self._assert_split_or_fallback()
 
-        obs_dim = self.n_assets
-        self.observation_space = spaces.Dict(
-            {
-                "momentum": spaces.Box(low=-np.inf, high=np.inf, shape=(obs_dim,), dtype=np.float32),
-                "meanrev": spaces.Box(low=-np.inf, high=np.inf, shape=(obs_dim,), dtype=np.float32),
-            }
-        )
-        low = -1.0 if self.allow_short else 0.0
-        act_dim = self.n_assets + (1 if self.cash_node else 0)
-        self.action_space = spaces.Box(low=low, high=1.0, shape=(act_dim,), dtype=np.float32)
+        # Finalize spaces with real shapes
+        self.n_assets = len(self.tickers)
+        self.n_features = len(self.factor_cols)
+        self.action_space = spaces.Box(low=-1.0, high=1.0, shape=(self.n_assets,), dtype=np.float32)
+        self.observation_space = spaces.Box(low=-10, high=10, shape=(self.n_assets, self.n_features), dtype=np.float32)
 
-        # per-date panels, sanitized
-        self.panel_by_date: Dict[pd.Timestamp, pd.DataFrame] = {}
-        for d in self.dates:
-            panel_d = (
-                self.df.loc[self.df["date"] == d]
-                .set_index("symbol")
-                .reindex(self.symbols)
-            )
-            for c in ["ret_1d", "spec_momentum", "spec_meanrev"]:
-                panel_d[c] = pd.to_numeric(panel_d[c], errors="coerce").replace([np.inf, -np.inf], np.nan).fillna(0.0)
-            self.panel_by_date[d] = panel_d
+        # state
+        self.pos = np.zeros(self.n_assets, dtype=np.float64)
+        self.cash = 1.0
+        self.t = 1  # start at 1 to have t-1 returns
+        self.start_t = int(self.idx.min())
+        self.end_t = int(self.idx.max())
+        self.t = self.start_t + 1
 
-        # reward weights
-        self.lambda_tc = float(self.cfg["reward"]["lambda_tc_bps"]) / 10000.0
-        self.lambda_sigma = float(self.cfg["reward"]["lambda_sigma"])
-        self.lambda_dd = float(self.cfg["reward"]["lambda_dd"])
-        self.max_w_name = float(self.cfg["actions"]["max_weight_per_name"])
+        # Reward penalties
+        rw = self.cfg.get("reward", {})
+        self.lambda_tc_bps = float(rw.get("lambda_tc_bps", 1.0))
+        self.lambda_sigma  = float(rw.get("lambda_sigma", 0.10))
+        self.lambda_dd     = float(rw.get("lambda_dd", 0.05))
+        self.turnover_limit= float(rw.get("turnover_limit_bps", 1000.0))
 
-        # reset state
-        self.t = 0
-        self.portfolio_value = 1.0
-        self.peak_value = 1.0
-        self.prev_w = np.zeros(self.action_space.shape[0], dtype=np.float32)
-        if self.cash_node:
-            self.prev_w[-1] = 1.0
+        self._equity = 1.0
+        self._peak = 1.0
+        self._ret_hist = []
 
-    # helpers
-    @staticmethod
-    def _finite(arr: np.ndarray) -> np.ndarray:
-        return np.nan_to_num(arr, nan=0.0, posinf=0.0, neginf=0.0).astype(np.float32)
+    # --------- helpers
 
-    def _obs(self, d: pd.Timestamp) -> Dict[str, np.ndarray]:
-        panel = self.panel_by_date[d]
-        mom = self._finite(panel["spec_momentum"].to_numpy(np.float32))
-        mr = self._finite(panel["spec_meanrev"].to_numpy(np.float32))
-        return {"momentum": mom, "meanrev": mr}
+    def _align_dates(self, frames):
+        idx = None
+        for df in frames:
+            d = pd.to_datetime(df["date"])
+            idx = d if idx is None else idx.intersection(d)
+        return idx.sort_values().unique()
 
-    def _project(self, w: np.ndarray) -> np.ndarray:
-        w = np.asarray(w, dtype=np.float32).copy()
-        cap = self.max_w_name
-        asset_w = w[:-1] if self.cash_node else w
-        lo = -cap if self.allow_short else 0.0
-        hi = cap
-        asset_w = np.clip(asset_w, lo, hi)
-        if self.cash_node:
-            if not self.allow_short:
-                asset_w = np.clip(asset_w, 0.0, None)
-            s = float(asset_w.sum())
-            if s > 1.0:
-                asset_w /= s
-            cash = 1.0 - float(asset_w.sum())
-            w = np.concatenate([asset_w, np.array([cash], dtype=np.float32)])
-        else:
-            s = float(asset_w.sum())
-            w = np.ones_like(asset_w, dtype=np.float32) / len(asset_w) if s <= 0 else asset_w / s
-        return w
+    def _reindex_one(self, df, dates):
+        df = df.set_index("date").reindex(dates).ffill().dropna().reset_index().rename(columns={"index": "date"})
+        return df
 
-    # gym api
-    def reset(self, *, seed: int | None = None, options: dict | None = None) -> Tuple[Dict[str, np.ndarray], Dict]:
+    def _build_panel(self, cols):
+        T = len(self.dates)
+        A = len(self.tickers)
+        F = len(cols)
+        X = np.zeros((T, A, F), dtype=np.float64)
+        for a, sym in enumerate(self.tickers):
+            df = self.data[sym]
+            df = df[df["date"].isin(self.dates)]
+            arr = df[cols].values.astype(np.float64)
+            X[:len(arr), a, :] = arr
+        X = np.nan_to_num(X, nan=0.0, posinf=0.0, neginf=0.0)
+        return X
+
+    def _series_ret(self, price: np.ndarray) -> np.ndarray:
+        p = price.astype(np.float64)
+        r = np.zeros_like(p)
+        r[1:] = np.where(p[:-1] > 0, p[1:] / p[:-1] - 1.0, 0.0)
+        return np.nan_to_num(r, nan=0.0, posinf=0.0, neginf=0.0)
+
+    def _build_returns(self):
+        T = len(self.dates)
+        A = len(self.tickers)
+        R = np.zeros((T, A), dtype=np.float64)
+        for a, sym in enumerate(self.tickers):
+            px = self.data[sym]["adj_close"].values
+            R[:, a] = self._series_ret(px)
+        return np.nan_to_num(R, nan=0.0, posinf=0.0, neginf=0.0)
+
+    def _resolve_mode(self, mode: str) -> str:
+        mode = (mode or "train").lower()
+        return "train" if mode not in {"train","val","test"} else mode
+
+    def _assert_split_or_fallback(self):
+        # if requested split empty, fallback to val→train with notice
+        if len(self.idx) == 0:
+            order = ["test","val","train"]
+            wanted = self.mode
+            for m in order:
+                if np.any(self.split_idx[m]):
+                    self.mode = m
+                    self.idx = np.where(self.split_idx[m])[0]
+                    print(f"[env] Requested mode '{wanted}' had no data. Falling back to '{m}'.")
+                    return
+            raise RuntimeError("No data in any split.")
+
+    # --------- Gym API
+
+    def reset(self, *, seed=None, options=None):
         super().reset(seed=seed)
-        self.t = 0
-        self.portfolio_value = 1.0
-        self.peak_value = 1.0
-        self.prev_w = np.zeros(self.action_space.shape[0], dtype=np.float32)
-        if self.cash_node:
-            self.prev_w[-1] = 1.0
-        obs = self._obs(self.dates[self.t])
-        info: Dict = {"mode": self.mode}
-        return obs, info
+        self.pos[:] = 0.0
+        self.cash = 1.0
+        self._equity = 1.0
+        self._peak = 1.0
+        self._ret_hist = []
+        self.t = self.start_t + 1
+        return self._obs()
 
-    def step(self, action: np.ndarray) -> Tuple[Dict[str, np.ndarray], float, bool, bool, Dict]:
-        action = np.asarray(action, dtype=np.float32)
-        w = self._project(action)
+    def _obs(self):
+        return self.Xz[self.t, :, :].astype(np.float32)
 
-        d = self.dates[self.t]
-        panel = self.panel_by_date[d]
-        rets = self._finite(panel["ret_1d"].to_numpy(np.float32))
-        if self.cash_node:
-            rets = np.concatenate([rets, np.array([0.0], dtype=np.float32)])
+    def step(self, action):
+        action = np.asarray(action, dtype=np.float64).reshape(-1)
+        # Convert action to target weights in [-1,1]; enforce constraints
+        if not np.all(np.isfinite(action)):
+            action = np.nan_to_num(action, nan=0.0)
+        # Long-only option
+        if not self.cfg["actions"].get("allow_short", False):
+            action = np.clip(action, 0.0, 1.0)
+        # Cap per-name
+        cap = float(self.cfg["actions"].get("max_weight_per_name", 0.10))
+        action = np.clip(action, -cap, cap)
+        # Normalize to <= 1 gross, leave remainder as cash if cash_node
+        gross = np.sum(np.abs(action))
+        cash_node = bool(self.cfg["actions"].get("cash_node", True))
+        if gross > 1.0:
+            action = action / max(gross, 1e-9)
+            gross = 1.0
+        cash_w = 1.0 - gross if cash_node else 0.0
 
-        turnover = float(np.abs(w - self.prev_w).sum())
-        tc_cost = self.lambda_tc * turnover
-        port_ret = float((w * rets).sum())
-        vol_pen = self.lambda_sigma * float(np.std(rets))
+        # Turnover cost (bps per 100% turnover)
+        turnover = np.sum(np.abs(action - self.pos))
+        tc = (self.lambda_tc_bps / 10000.0) * turnover
 
-        pv_next = self.portfolio_value * (1.0 + port_ret - tc_cost - vol_pen)
-        if not np.isfinite(pv_next) or pv_next <= 0:
-            pv_next = self.portfolio_value
-        self.portfolio_value = pv_next
-        self.peak_value = max(self.peak_value, self.portfolio_value)
-        dd = (self.peak_value - self.portfolio_value) / max(self.peak_value, 1e-12)
-        dd_pen = self.lambda_dd * float(dd)
+        # Realized portfolio return next step
+        r = self.R[self.t, :]  # at t, use return from t-1→t
+        port_ret = float(np.dot(action, r)) + cash_w * 0.0
+        bench_r  = float(self.bench_ret[self.t])
+        excess   = port_ret - bench_r
 
-        reward = float(port_ret - tc_cost - vol_pen - dd_pen)
-        if not np.isfinite(reward):
-            reward = 0.0
+        # Track equity and stats
+        self._equity *= (1.0 + port_ret)
+        self._peak = max(self._peak, self._equity)
+        dd = 1.0 - (self._equity / self._peak + 1e-12)
 
-        self.prev_w = w
+        self._ret_hist.append(port_ret)
+        realized_vol = float(np.std(self._ret_hist[-63:]) if len(self._ret_hist) >= 2 else 0.0)
+
+        # Reward (excess return minus penalties)
+        reward = excess - tc - self.lambda_sigma * realized_vol - self.lambda_dd * dd
+
+        # Advance time
+        self.pos = action
         self.t += 1
-        terminated = self.t >= (len(self.dates) - 1)
-        truncated = False
-        next_obs = self._obs(self.dates[min(self.t, len(self.dates) - 1)])
-        info = {"turnover": turnover, "tc_cost": tc_cost, "dd": float(dd), "port_ret": port_ret, "mode": self.mode}
-        return next_obs, reward, terminated, truncated, info
+        done = bool(self.t >= self.end_t)
+        info = {
+            "port_ret": port_ret,
+            "bench_ret": bench_r,
+            "excess_ret": excess,
+            "turnover": turnover,
+            "equity": self._equity,
+            "drawdown": dd,
+        }
+        return self._obs(), float(reward), done, info
+
 
 
 

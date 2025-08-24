@@ -1,138 +1,147 @@
-# src/feature_engineering.py
-from pathlib import Path
+import os
+import warnings
 import pandas as pd
 import numpy as np
 import yaml
 
-CFG_PATH = Path("config.yaml")
+RAW_DIR = os.path.join("data", "raw")
+PROC_DIR = os.path.join("data", "processed")
+os.makedirs(PROC_DIR, exist_ok=True)
 
-
-def load_config():
-    with open(CFG_PATH, "r") as f:
+def read_config():
+    with open("config.yaml", "r") as f:
         return yaml.safe_load(f)
 
-
-def rsi(series: pd.Series, window: int = 14) -> pd.Series:
-    delta = series.diff()
-    gain = delta.clip(lower=0.0)
-    loss = -delta.clip(upper=0.0)
-    avg_gain = gain.rolling(window).mean()
-    avg_loss = loss.rolling(window).mean()
-    rs = avg_gain / (avg_loss + 1e-12)
-    return 100 - (100 / (1 + rs))
-
-
-def _read_raw(fp: Path) -> pd.DataFrame:
-    """
-    Robust reader:
-      - CSV: if no 'date' column, force first column as datetime 'date'
-      - Parquet: read as-is
-    """
-    if fp.suffix.lower() == ".csv":
-        df0 = pd.read_csv(fp)
-        lower = [c.lower() for c in df0.columns]
-        if "date" in lower:
-            df0 = df0.rename(columns={df0.columns[lower.index("date")]: "date"})
-            df0["date"] = pd.to_datetime(df0["date"], errors="coerce")
-            return df0
-        # force first column as date
-        df = pd.read_csv(fp, parse_dates=[0])
-        df = df.rename(columns={df.columns[0]: "date"})
-        return df
-    return pd.read_parquet(fp)
-
-
-def _normalize(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Ensure required columns (numeric) exist:
-      date, open, high, low, close, adj_close, volume
-    """
-    # normalize headers
-    df.columns = [str(c).strip().lower().replace(" ", "_") for c in df.columns]
-
-    if "date" not in df.columns:
-        raise KeyError(f"Missing 'date'. Columns: {list(df.columns)}")
-
-    # adjusted close fallback
-    if "adj_close" not in df.columns:
-        if "adjclose" in df.columns:
-            df = df.rename(columns={"adjclose": "adj_close"})
-        elif "adjusted_close" in df.columns:
-            df = df.rename(columns={"adjusted_close": "adj_close"})
-        elif "close" in df.columns:
-            df["adj_close"] = df["close"]
-
-    # drop extra 'price' if present
-    if "price" in df.columns and "adj_close" in df.columns:
-        df = df.drop(columns=["price"])
-
-    # coerce numerics
-    for col in ("open", "high", "low", "close", "adj_close", "volume"):
-        if col in df.columns:
-            df[col] = pd.to_numeric(df[col], errors="coerce")
-
-    # clean and sort
-    df["date"] = pd.to_datetime(df["date"], errors="coerce")
-    df = df.dropna(subset=["date", "adj_close"]).sort_values("date")
-
-    need = ["date", "open", "high", "low", "close", "adj_close", "volume"]
-    missing = [c for c in need if c not in df.columns]
-    if missing:
-        raise KeyError(f"Missing required columns {missing}. Got: {list(df.columns)}")
-
+def _lower_cols(df: pd.DataFrame) -> pd.DataFrame:
+    df = df.copy()
+    df.columns = [str(c).strip().lower() for c in df.columns]
     return df
 
+def _ensure_ohlcv(df: pd.DataFrame) -> pd.DataFrame:
+    # Accept common variants
+    mapping = {}
+    cols = set(df.columns)
+    def pick(*options):
+        for o in options:
+            if o in cols:
+                return o
+        return None
 
-def run():
-    cfg = load_config()
-    data_dir = Path(cfg["storage"]["local_data_dir"])
-    raw_dir = data_dir / "raw"
-    proc_dir = data_dir / "processed"
-    proc_dir.mkdir(parents=True, exist_ok=True)
+    open_c = pick("open")
+    high_c = pick("high")
+    low_c  = pick("low")
+    close_c= pick("close","adj close","adj_close","close*")
+    vol_c  = pick("volume","vol")
 
-    mom_w = int(cfg["factors"]["momentum_21d"]["window"])
-    rsi_w = int(cfg["factors"]["rsi_14"]["window"])
-    vol_w = int(cfg["factors"]["vol_21d"]["window"])
+    rename = {}
+    if open_c and open_c != "open": rename[open_c] = "open"
+    if high_c and high_c != "high": rename[high_c] = "high"
+    if low_c  and low_c  != "low":  rename[low_c]  = "low"
+    if close_c and close_c != "close": rename[close_c] = "close"
+    if vol_c and vol_c != "volume": rename[vol_c] = "volume"
+    df = df.rename(columns=rename)
 
-    files = sorted(raw_dir.glob("*.*"))
-    print(f"[features] raw_dir={raw_dir} files={len(list(files))}")
-    files = sorted(raw_dir.glob("*.*"))  # re-glob after printing
+    needed = ["date","open","high","low","close","volume"]
+    missing = [c for c in needed if c not in df.columns]
+    if missing:
+        raise ValueError(f"Missing columns after normalization: {missing}")
+    return df[needed]
 
-    if not files:
-        print("[features] No raw files. Run: python -m src.data_pipeline")
-        return
+def _add_base(df: pd.DataFrame) -> pd.DataFrame:
+    df = df.copy()
+    df["date"] = pd.to_datetime(df["date"], errors="coerce")
+    df = df.sort_values("date").dropna(subset=["date"]).reset_index(drop=True)
+    # adj_close proxy = close (yfinance CSV already adjusted for splits/divs on 'Adj Close' normally;
+    # here we standardize on 'close' as adjusted)
+    df["adj_close"] = df["close"].astype(float)
+    return df
 
-    for fp in files:
+def _rsi(series: pd.Series, window: int = 14) -> pd.Series:
+    delta = series.diff()
+    up = delta.clip(lower=0).rolling(window).mean()
+    down = (-delta.clip(upper=0)).rolling(window).mean()
+    rs = up / (down + 1e-12)
+    return 100 - (100 / (1 + rs))
+
+def _atr(df: pd.DataFrame, window: int = 14) -> pd.Series:
+    high = df["high"].astype(float)
+    low = df["low"].astype(float)
+    close = df["close"].astype(float)
+    prev_close = close.shift(1)
+    tr = pd.concat([
+        (high - low).abs(),
+        (high - prev_close).abs(),
+        (low - prev_close).abs()
+    ], axis=1).max(axis=1)
+    return tr.rolling(window).mean()
+
+def build_features(df: pd.DataFrame, cfg: dict) -> pd.DataFrame:
+    df = df.copy()
+    fcfg = cfg.get("factors", {})
+    # Returns
+    df["ret_1d"] = df["adj_close"].pct_change()
+
+    if "momentum_21d" in fcfg:
+        w = int(fcfg["momentum_21d"].get("window", 21))
+        df["mom_21d"] = df["adj_close"].pct_change(w)
+
+    if "momentum_63d" in fcfg:
+        w = int(fcfg["momentum_63d"].get("window", 63))
+        df["mom_63d"] = df["adj_close"].pct_change(w)
+
+    if "rsi_14" in fcfg:
+        w = int(fcfg["rsi_14"].get("window", 14))
+        df["rsi_14"] = _rsi(df["adj_close"], w)
+
+    if "vol_21d" in fcfg:
+        w = int(fcfg["vol_21d"].get("window", 21))
+        df["vol_21d"] = df["ret_1d"].rolling(w).std()
+
+    if "atr_14" in fcfg:
+        w = int(fcfg["atr_14"].get("window", 14))
+        df["atr_14"] = _atr(df, w)
+
+    if "ma_fast_10" in fcfg:
+        w = int(fcfg["ma_fast_10"].get("window", 10))
+        df["ma_fast_10"] = df["adj_close"].rolling(w).mean()
+
+    if "ma_slow_50" in fcfg:
+        w = int(fcfg["ma_slow_50"].get("window", 50))
+        df["ma_slow_50"] = df["adj_close"].rolling(w).mean()
+
+    # Drop warm-up NaNs safely
+    df = df.dropna().reset_index(drop=True)
+    return df
+
+def main():
+    cfg = read_config()
+    files = [f for f in os.listdir(RAW_DIR) if f.lower().endswith(".csv")]
+    print(f"[features] raw_dir={RAW_DIR} files={len(files)}")
+    for f in sorted(files):
         try:
-            print(f"[features] Reading {fp.name}")
-            df = _read_raw(fp)
-            print(f"[features] {fp.name} cols(before): {list(df.columns)} rows={len(df)}")
-            df = _normalize(df)
-            print(f"[features] {fp.name} cols(after): {list(df.columns)} rows={len(df)}")
-
-            # returns
-            df["ret_1d"] = df["adj_close"].pct_change(fill_method=None)
-
-            # factors
-            df[f"mom_{mom_w}"] = (df["adj_close"] / df["adj_close"].shift(mom_w)) - 1.0
-            df[f"rsi_{rsi_w}"] = rsi(df["adj_close"], rsi_w)
-            df[f"vol_{vol_w}"] = df["ret_1d"].rolling(vol_w).std() * np.sqrt(252)
-
-            # specialist views
-            df["spec_momentum"] = df[f"mom_{mom_w}"].fillna(0.0)
-            df["spec_meanrev"] = (-df["ret_1d"].rolling(5).mean()).fillna(0.0)
-
-            out = proc_dir / (fp.stem + ".parquet")
+            print(f"[features] Reading {f}")
+            fp = os.path.join(RAW_DIR, f)
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore", category=UserWarning)
+                df = pd.read_csv(fp, parse_dates=[0])
+            df = _lower_cols(df)
+            df = _ensure_ohlcv(df)
+            before_cols, before_rows = list(df.columns), len(df)
+            df = _add_base(df)
+            df = build_features(df, cfg)
+            after_cols, after_rows = list(df.columns), len(df)
+            print(f"[features] {f} cols(before): {before_cols} rows={before_rows}")
+            print(f"[features] {f} cols(after): {after_cols} rows={after_rows}")
+            out = os.path.join(PROC_DIR, f.replace(".csv", ".parquet"))
             df.to_parquet(out, index=False)
             print(f"[features] Saved {out}")
         except Exception as e:
-            print(f"[features] ERROR {fp.name}: {e}")
-
-    print(f"[features] Done. Check {proc_dir} for parquet outputs.")
-
+            print(f"[features] ERROR {f}: {e}")
+    print("[features] Done. Check data\\processed for parquet outputs.")
 
 if __name__ == "__main__":
-    run()
+    main()
+
 
 
 

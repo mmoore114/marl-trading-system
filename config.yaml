@@ -6,7 +6,7 @@ data:
   start_date: "2018-01-01"
   end_date: "2025-08-01"
   price_frequency: "1d"
-  source: "yfinance"           # prototype mode; switch to "eodhd" later
+  source: "yfinance"           # prototype; switch to "eodhd" later
 
 eodhd:
   api_key_env: "EODHD_API_KEY"
@@ -18,11 +18,15 @@ splits:
 
 factors:
   momentum_21d: {window: 21}
+  momentum_63d: {window: 63}
   rsi_14:       {window: 14}
   vol_21d:      {window: 21}
+  atr_14:       {window: 14}
+  ma_fast_10:   {window: 10}
+  ma_slow_50:   {window: 50}
 
 reward:
-  lambda_tc_bps: 1.0           # cost per 100% turnover
+  lambda_tc_bps: 1.0           # cost per 100% turnover (basis points)
   lambda_sigma:  0.10          # volatility penalty
   lambda_dd:     0.05          # drawdown penalty
   turnover_limit_bps: 1000
@@ -34,17 +38,31 @@ actions:
 
 training:
   algo: "PPO"
-  total_timesteps: 150000
+  total_timesteps: 300000
   n_envs: 4
   seed: 42
+
+  # PPO hyperparams (SB3)
+  n_steps: 2048
+  batch_size: 4096
+  gae_lambda: 0.95
+  gamma: 0.99
+  ent_coef: 0.005
+  vf_coef: 0.5
+  max_grad_norm: 0.5
+  clip_range: 0.2
+  target_kl: 0.02
+  learning_rate: 3.0e-4
+
   policy_kwargs:
     net_arch:
-      pi: [128, 128]
-      vf: [128, 128]
+      pi: [256, 256]
+      vf: [256, 256]
+    ortho_init: true
 
 eval:
-  eval_episodes: 3
-  eval_freq_steps: 10000
+  eval_episodes: 5
+  eval_freq_steps: 20000
 
 storage:
   local_data_dir: "data"
