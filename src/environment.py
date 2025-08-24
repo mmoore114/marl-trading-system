@@ -54,7 +54,25 @@ class MultiStrategyEnv(gym.Env):
         self.cfg = _load_cfg(cfg_path)
         self.mode = mode
 
-        # Paths
+        # ---- Define placeholder spaces EARLY so SB3 can seed immediately
+        self.n_assets = 1
+        self.allow_short = False
+        self.cash_node = False
+        self.observation_space = spaces.Dict(
+            {
+                "momentum": spaces.Box(low=-np.inf, high=np.inf, shape=(1,), dtype=np.float32),
+                "meanrev": spaces.Box(low=-np.inf, high=np.inf, shape=(1,), dtype=np.float32),
+            }
+        )
+        self.action_space = spaces.Box(low=0.0, high=1.0, shape=(1,), dtype=np.float32)
+
+        # Bookkeeping placeholders
+        self.t = 0
+        self.portfolio_value = 1.0
+        self.peak_value = 1.0
+        self.prev_w = np.zeros(self.action_space.shape[0], dtype=np.float32)
+
+        # ---- Real initialization below
         self.data_dir = Path(self.cfg["storage"]["local_data_dir"])
         self.proc_dir = self.data_dir / "processed"
 
@@ -95,7 +113,137 @@ class MultiStrategyEnv(gym.Env):
         self.dates = sorted(self.df["date"].unique())
         if len(self.dates) < 5:
             raise RuntimeError(
-                f"Not enough dates in {self.mode} split: only {len(self.dates)} found."
+                f"Not enough dates in {self.mode} split ({len(self.dates)}). "
+                f"Check your splits in config.yaml or regenerate features."
             )
+
+        # Now that we know the true sizes, set final spaces
+        self.n_assets = len(self.symbols)
+        self.allow_short = bool(self.cfg["actions"]["allow_short"])
+        self.cash_node = bool(self.cfg["actions"]["cash_node"])
+
+        obs_dim = self.n_assets
+        self.observation_space = spaces.Dict(
+            {
+                "momentum": spaces.Box(low=-np.inf, high=np.inf, shape=(obs_dim,), dtype=np.float32),
+                "meanrev": spaces.Box(low=-np.inf, high=np.inf, shape=(obs_dim,), dtype=np.float32),
+            }
+        )
+        low = -1.0 if self.allow_short else 0.0
+        act_dim = self.n_assets + (1 if self.cash_node else 0)
+        self.action_space = spaces.Box(low=low, high=1.0, shape=(act_dim,), dtype=np.float32)
+
+        # Pre-index by date for fast step()
+        self.panel_by_date: Dict[pd.Timestamp, pd.DataFrame] = {}
+        for d in self.dates:
+            self.panel_by_date[d] = (
+                self.df.loc[self.df["date"] == d]
+                .set_index("symbol")
+                .reindex(self.symbols)
+            )
+
+        # Reward knobs
+        self.lambda_tc = float(self.cfg["reward"]["lambda_tc_bps"]) / 10000.0
+        self.lambda_sigma = float(self.cfg["reward"]["lambda_sigma"])
+        self.lambda_dd = float(self.cfg["reward"]["lambda_dd"])
+        self.max_w_name = float(self.cfg["actions"]["max_weight_per_name"])
+
+        # Bookkeeping reset
+        self.t = 0
+        self.portfolio_value = 1.0
+        self.peak_value = 1.0
+        self.prev_w = np.zeros(self.action_space.shape[0], dtype=np.float32)
+        if self.cash_node:
+            self.prev_w[-1] = 1.0
+
+    # -------- helpers
+    def _obs(self, d: pd.Timestamp) -> Dict[str, np.ndarray]:
+        panel = self.panel_by_date[d]
+        return {
+            "momentum": panel["spec_momentum"].to_numpy(np.float32),
+            "meanrev": panel["spec_meanrev"].to_numpy(np.float32),
+        }
+
+    def _project(self, w: np.ndarray) -> np.ndarray:
+        w = np.asarray(w, dtype=np.float32).copy()
+
+        cap = self.max_w_name
+        if self.cash_node:
+            asset_w = w[:-1]
+        else:
+            asset_w = w
+
+        # Per-name cap & shorting rules
+        lo = -cap if self.allow_short else 0.0
+        hi = cap
+        asset_w = np.clip(asset_w, lo, hi)
+
+        # Normalize + cash node
+        if self.cash_node:
+            if not self.allow_short:
+                asset_w = np.clip(asset_w, 0.0, None)
+            s = float(asset_w.sum())
+            if s > 1.0:
+                asset_w /= s
+            cash = 1.0 - float(asset_w.sum())
+            w = np.concatenate([asset_w, np.array([cash], dtype=np.float32)])
+        else:
+            s = float(asset_w.sum())
+            if s <= 0:
+                w = np.ones_like(asset_w, dtype=np.float32) / len(asset_w)
+            else:
+                w = asset_w / s
+        return w
+
+    # -------- Gym API
+    def reset(self, *, seed: int | None = None, options: dict | None = None) -> Tuple[Dict[str, np.ndarray], Dict]:
+        # Must return (obs, info) for Gymnasium + SB3 v2.x
+        super().reset(seed=seed)
+        self.t = 0
+        self.portfolio_value = 1.0
+        self.peak_value = 1.0
+        self.prev_w = np.zeros(self.action_space.shape[0], dtype=np.float32)
+        if self.cash_node:
+            self.prev_w[-1] = 1.0
+        obs = self._obs(self.dates[self.t])
+        info: Dict = {}
+        return obs, info
+
+    def step(self, action: np.ndarray) -> Tuple[Dict[str, np.ndarray], float, bool, bool, Dict]:
+        action = np.asarray(action, dtype=np.float32)
+        w = self._project(action)
+
+        d = self.dates[self.t]
+        panel = self.panel_by_date[d]
+        asset_rets = panel["ret_1d"].to_numpy(np.float32)
+        if self.cash_node:
+            asset_rets = np.concatenate([asset_rets, np.array([0.0], dtype=np.float32)])
+
+        # Turnover cost
+        turnover = float(np.abs(w - self.prev_w).sum())
+        tc_cost = self.lambda_tc * turnover
+
+        # Raw portfolio return
+        port_ret = float((w * asset_rets).sum())
+
+        # Volatility proxy (cross-sectional dispersion of returns)
+        vol_pen = self.lambda_sigma * float(np.std(asset_rets))
+
+        # Update equity + drawdown
+        self.portfolio_value *= (1.0 + port_ret - tc_cost - vol_pen)
+        self.peak_value = max(self.peak_value, self.portfolio_value)
+        dd = (self.peak_value - self.portfolio_value) / self.peak_value
+        dd_pen = self.lambda_dd * float(dd)
+
+        reward = port_ret - tc_cost - vol_pen - dd_pen
+        self.prev_w = w
+
+        self.t += 1
+        terminated = self.t >= (len(self.dates) - 1)
+        truncated = False
+        info = {"turnover": turnover, "tc_cost": tc_cost, "dd": float(dd), "port_ret": port_ret}
+        next_obs = self._obs(self.dates[min(self.t, len(self.dates) - 1)])
+        return next_obs, reward, terminated, truncated, info
+
 
 
