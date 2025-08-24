@@ -1,24 +1,43 @@
-# RL core
-stable-baselines3>=2.2.1,<3.0
-torch>=2.1.0
+# Core RL stack (MARL with RLlib; SB3 for single-agent fallback)
+ray[rllib]>=2.9.0
+stable-baselines3>=2.3.0
+torch>=2.3.0
+gymnasium>=0.29.1
 
-# Gym API used by the env
-gym==0.26.2
-cloudpickle>=2.2.1
-gym-notices>=0.0.8
+# Utilities
+cloudpickle>=3.0.0
+tensorboard>=2.17.0  # For logging
+optuna>=3.6.1  # For hyperparam tuning
 
-# Data + features
-pandas>=2.0
-numpy>=1.24
-pyyaml>=6.0
-yfinance>=0.2.40
+# Data stack
+pandas>=2.2.0
+numpy>=1.26.0
+pyyaml>=6.0.1
+yfinance>=0.2.41
+pyarrow>=16.1.0
+requests>=2.32.3  # For EODHD
+ib-insync>=0.9.89  # For IBKR
+python-dotenv>=1.0.1  # For keys
 
-# Parquet (fast + reliable)
-pyarrow>=15.0.0
-
-# Backtest reporting
+# Analysis & reporting
 quantstats>=0.0.62
-matplotlib>=3.7
-scipy>=1.10
+matplotlib>=3.9.0
+seaborn>=0.13.2
+scipy>=1.13.0
+ta-lib>=0.4.28  # Technical indicators
+
+# NLP/Sentiment
+newsapi-python>=0.2.7
+transformers>=4.43.3
+torch>=2.3.0  # Already included
+sentencepiece>=0.2.0  # For FinBERT
+
+# Testing/Logging
+pytest>=8.3.2
+logging>=0.4.9.6  # Standard lib, but ensure
+tenacity>=8.5.0  # Retries
+
+# Optional (for parallelism, etc.)
+joblib>=1.4.2
 
 
