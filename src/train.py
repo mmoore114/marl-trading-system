@@ -4,12 +4,17 @@ from __future__ import annotations
 import yaml
 from stable_baselines3 import PPO
 from stable_baselines3.common.env_util import make_vec_env
+from stable_baselines3.common.monitor import Monitor
 
 from src.environment import MultiStrategyEnv
 
 
 def make_env(mode: str):
-    return lambda: MultiStrategyEnv(mode=mode)
+    # Wrap with Monitor to ensure Gymnasium <-> SB3 compatibility (obs, info handling etc.)
+    def _init():
+        e = MultiStrategyEnv(mode=mode)
+        return Monitor(e)
+    return _init
 
 
 def main():

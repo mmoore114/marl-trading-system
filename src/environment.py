@@ -173,5 +173,14 @@ class MultiStrategyEnv(gym.Env):
         else:
             s = float(asset_w.sum())
             if s <= 0:
-                w = np.on
+                w = np.ones_like(asset_w, dtype=np.float32) / len(asset_w)
+            else:
+                w = asset_w / s
+        return w
+
+    # -------- Gym API
+    def reset(self, *, seed: int | None = None, options: dict | None = None) -> Tuple[Dict[str, np.ndarray], Dict]:
+        # Gymnasium expects (obs, info). SB3 DummyVecEnv expects the same when using Gymnasium.
+        super().reset(seed=seed)
+
 
