@@ -53,5 +53,22 @@ storage:
 logging:
   use_mlflow: false
   mlflow_uri: ""
+universe:
+  tickers:
+    - AAPL
+    - AMZN
+    - DOW
+    - DUK
+    - GE
+    - GOOGL
+    - JPM
+    - META
+    - MSFT
+    - NVDA
+    - PFE
+    - PG
+    - SPG
+    - TSLA
+    - XOM
 
 
