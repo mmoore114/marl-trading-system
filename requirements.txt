@@ -16,7 +16,7 @@ pyyaml>=6.0.1
 yfinance>=0.2.41
 pyarrow>=16.1.0
 requests>=2.32.3  # For EODHD
-ib-insync>=0.9.89  # For IBKR
+ib-insync==0.9.86 # For IBKR
 python-dotenv>=1.0.1  # For keys
 
 # Analysis & reporting
