@@ -4,16 +4,17 @@ from __future__ import annotations
 import yaml
 from stable_baselines3 import PPO
 from stable_baselines3.common.env_util import make_vec_env
-from stable_baselines3.common.monitor import Monitor
+# NOTE: we intentionally do NOT wrap with Monitor or FlattenObservation here.
+# - Monitor can be added later for episode stats if needed.
+# - PPO with MultiInputPolicy expects Dict observations; do not flatten.
 
 from src.environment import MultiStrategyEnv
 
 
 def make_env(mode: str):
-    # Wrap with Monitor to ensure Gymnasium <-> SB3 compatibility (obs, info handling etc.)
     def _init():
         e = MultiStrategyEnv(mode=mode)
-        return Monitor(e)
+        return e
     return _init
 
 
@@ -44,3 +45,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
