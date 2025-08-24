@@ -1,219 +1,141 @@
-"""
-Backtester (Gymnasium/Gym compatible)
-
-- Loads the trained model
-- Runs on MultiStrategyEnv(mode="test")
-- Normalizes env.reset() / env.step() returns for Gymnasium vs Gym
-- Saves equity curve CSV and a QuantStats HTML report
-"""
-
 from __future__ import annotations
 
-import os
-import glob
-import math
+import argparse
+import sys
 from pathlib import Path
-from typing import Any, Dict, Tuple
+from typing import Tuple, Optional
 
 import numpy as np
 import pandas as pd
-
-# SB3
+import logging
 from stable_baselines3 import PPO
+from ray.rllib.policy.policy import PolicySpec  # For MARL if needed
 
-# Reporting
-import quantstats as qs
+try:
+    import quantstats as qs
+except ImportError:
+    qs = None
 
-# Your trading env
-from src.environment import MultiStrategyEnv
+from src.environment import TradingEnv
 
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
-# ---------- Helpers to normalize Gym vs Gymnasium API ----------
+def _ensure_reports_dir() -> Path:
+    d = Path("reports")
+    d.mkdir(parents=True, exist_ok=True)
+    return d
 
-def reset_compat(env) -> np.ndarray:
-    """
-    Gymnasium: obs, info = env.reset()
-    Gym:       obs = env.reset()
-    """
-    out = env.reset()
-    if isinstance(out, tuple) and len(out) >= 1:
-        obs = out[0]
-    else:
-        obs = out
-    return obs
+def _load_model(model_path: Path) -> PPO:
+    if not model_path.exists():
+        logger.error(f"Model not found: {model_path}")
+        sys.exit(1)
+    logger.info(f"Loading model: {model_path}")
+    return PPO.load(str(model_path), device="cpu")
 
+def main():
+    parser = argparse.ArgumentParser(description="Run backtest with trained PPO model.")
+    parser.add_argument("--model", default="models/ppo_specialist_super_agent_final.zip", help="SB3 .zip path.")
+    parser.add_argument("--max-steps", type=int, default=250000, help="Step cap.")
+    parser.add_argument("--progress-every", type=int, default=500, help="Log every N steps.")
+    parser.add_argument("--write-every", type=int, default=250, help="Save CSV every N steps.")
+    args = parser.parse_args()
 
-def step_compat(env, action) -> Tuple[np.ndarray, float, bool, Dict[str, Any]]:
-    """
-    Returns: obs, reward, done, info
+    reports_dir = _ensure_reports_dir()
 
-    Gymnasium: obs, reward, terminated, truncated, info
-               done := terminated or truncated
-    Gym:       obs, reward, done, info
-    """
-    out = env.step(action)
-    if isinstance(out, tuple) and len(out) == 5:
-        obs, reward, terminated, truncated, info = out
-        done = bool(terminated or truncated)
-        return obs, float(reward), done, info
-    elif isinstance(out, tuple) and len(out) == 4:
-        obs, reward, done, info = out
-        return obs, float(reward), bool(done), info
-    else:
-        raise RuntimeError(
-            f"Unexpected step() return: type={type(out)} len={len(out) if isinstance(out, tuple) else 'n/a'}"
-        )
+    model_path = Path(args.model)
+    model = _load_model(model_path)
+    env = TradingEnv(mode="test")
 
+    obs = env.reset()[0]  # obs dict
+    rewards = []
+    equities = []
+    steps = 0
 
-# ---------- Model loading ----------
+    tmp_eq_path = reports_dir / "backtest_equity_curve.tmp.csv"
+    final_eq_path = reports_dir / "backtest_equity_curve.csv"
+    summary_path = reports_dir / "summary.txt"
 
-def _find_latest_model(models_dir: Path) -> Path | None:
-    zips = sorted(models_dir.glob("*.zip"))
-    return zips[-1] if zips else None
+    logger.info("Running backtest...")
 
-
-def _load_model(models_dir: Path) -> PPO:
-    preferred = models_dir / "ppo_specialist_super_agent_final.zip"
-    ckpt = preferred if preferred.exists() else _find_latest_model(models_dir)
-    if ckpt is None:
-        raise FileNotFoundError(
-            f"No model checkpoint found in {models_dir}. "
-            f"Expected {preferred.name} or any *.zip file."
-        )
-    print(f"[backtest] Loading model -> {ckpt}")
-    return PPO.load(str(ckpt), device="cpu")
-
-
-# ---------- Backtest loop ----------
-
-def run() -> None:
-    reports_dir = Path("reports")
-    reports_dir.mkdir(parents=True, exist_ok=True)
-
-    env = MultiStrategyEnv(mode="test")
-    model = _load_model(Path("models"))
-
-    obs = reset_compat(env)
-    done = False
-
-    dates: list[pd.Timestamp] = []
-    equity: list[float] = []
-
-    # Start NAV at 1.0 and compound daily PnL (assuming reward ~ daily return)
-    nav = 1.0
-
-    step_counter = 0
-    while not done:
-        # SB3 expects observation as np.ndarray (or dict), not tuple
-        action, _ = model.predict(obs, deterministic=True)
-
-        obs, reward, done, info = step_compat(env, action)
-
-        # Try to fetch a timestamp to index the equity curve
-        dt = (
-            info.get("date")
-            if isinstance(info, dict)
-            else None
-        )
-        # Fallbacks if env supplies other date keys or properties
-        if dt is None and isinstance(info, dict):
-            dt = info.get("timestamp") or info.get("t") or info.get("bar_time")
-        if dt is None and hasattr(env, "current_date"):
-            dt = getattr(env, "current_date")
-        if dt is None and hasattr(env, "dates"):
-            # If env exposes full date index and a pointer
-            try:
-                cur_idx = getattr(env, "t", None)
-                if cur_idx is not None and 0 <= cur_idx < len(env.dates):
-                    dt = env.dates[cur_idx]
-            except Exception:
-                pass
-
-        # Normalize dt into pandas Timestamp or use step index
-        try:
-            dt_ts = pd.Timestamp(dt)
-        except Exception:
-            dt_ts = pd.NaT
-
-        # Assume reward is daily portfolio return (e.g., +0.004 = +0.4%)
-        if not (reward is None or (isinstance(reward, float) and (math.isnan(reward) or math.isinf(reward)))):
-            nav *= (1.0 + float(reward))
-
-        dates.append(dt_ts if not pd.isna(dt_ts) else pd.NaT)
-        equity.append(nav)
-
-        step_counter += 1
-
-    # Build equity curve DataFrame
-    eq = pd.DataFrame({"date": dates, "equity": equity})
-    # If dates are NaT (unknown), fall back to integer index but keep a date column
-    if eq["date"].isna().all():
-        eq["date"] = pd.RangeIndex(start=0, stop=len(eq), step=1)
-
-    # Drop potential duplicates and ensure sorted by date/index
     try:
-        eq = eq.drop_duplicates(subset=["date"]).sort_values("date")
-    except Exception:
-        eq = eq.reset_index(drop=True)
+        while True:
+            actions = {a: model.predict(obs[a], deterministic=True)[0] for a in env.agents}
+            obs, reward, terminated, truncated, info = env.step(actions)
+            rewards.append(list(reward.values())[0])  # Assume shared reward
 
-    csv_path = reports_dir / "backtest_equity_curve.csv"
-    eq.to_csv(csv_path, index=False)
-    print(f"[backtest] Saved equity curve -> {csv_path}")
+            eq = env._get_portfolio_value(np.array([env.frames[s].iloc[env.current_step]['Close'] for s in env.sym_list]))
+            if eq is not None:
+                equities.append(eq)
 
-    # Summary stats (simple)
-    returns = eq["equity"].pct_change().fillna(0.0)
-    total_return = (eq["equity"].iloc[-1] - 1.0) * 100.0 if len(eq) > 0 else 0.0
-    ann_vol = returns.std() * np.sqrt(252) * 100.0 if len(eq) > 1 else 0.0
-    sharpe = (
-        (returns.mean() * 252) / (returns.std() * np.sqrt(252))
-        if returns.std() > 0
-        else np.nan
-    )
-    max_dd = (
-        (eq["equity"] / eq["equity"].cummax() - 1.0).min() * 100.0
-        if len(eq) > 0
-        else 0.0
-    )
+            steps += 1
 
-    print("[backtest] Summary")
-    print(f"  Total Return: {total_return:.2f}%")
-    print(f"  Ann. Vol:      {ann_vol:.2f}%")
-    print(f"  Sharpe~:       {sharpe:.2f}" if not np.isnan(sharpe) else "  Sharpe~:       n/a")
-    print(f"  Max Drawdown:  {abs(max_dd):.2f}%")
+            if steps % args.progress_every == 0:
+                logger.info(f"Progress: {steps} steps")
 
-    # Save text summary
-    (reports_dir / "summary.txt").write_text(
-        "\n".join(
-            [
-                f"Total Return: {total_return:.2f}%",
-                f"Ann. Vol:     {ann_vol:.2f}%",
-                f"Sharpe~:      {sharpe:.2f}" if not np.isnan(sharpe) else "Sharpe~: n/a",
-                f"Max Drawdown: {abs(max_dd):.2f}%",
-            ]
-        ),
-        encoding="utf-8",
-    )
+            if steps % args.write_every == 0 and equities:
+                pd.Series(equities, name="equity").to_csv(tmp_eq_path, index=False)
 
-    # QuantStats HTML report (uses equity curve to compute returns)
+            if any(terminated.values()):
+                logger.info(f"Episode finished after {steps} steps.")
+                break
+
+            if steps >= args.max_steps:
+                logger.info(f"Reached max_steps={args.max_steps}.")
+                break
+
+    except KeyboardInterrupt:
+        logger.info("Interrupted. Saving outputs...")
+
+    # Equity series
+    if equities:
+        equity_series = pd.Series(equities, name="equity")
+    else:
+        rets = pd.Series(rewards, name="ret").fillna(0.0)
+        equity_series = (1.0 + rets).cumprod().rename("equity")
+
+    equity_series.to_csv(final_eq_path, header=True, index=False)
+    logger.info(f"Saved equity curve: {final_eq_path}")
+
+    if tmp_eq_path.exists():
+        tmp_eq_path.unlink()
+
+    # Summary
     try:
-        # Convert equity curve to price series (index=Datetime, values=equity)
-        s = eq.set_index("date")["equity"].copy()
-        # If index is not datetime-like, QS can still work, but let's try to coerce:
-        try:
-            s.index = pd.to_datetime(s.index)
-        except Exception:
-            pass
+        rets = equity_series.pct_change().fillna(0.0)
+        total_return = (1 + rets).prod() - 1
+        ann_vol = rets.std() * np.sqrt(252)
+        sharpe = (rets.mean() * 252) / (ann_vol + 1e-12)
+        dd = (equity_series / equity_series.cummax() - 1.0).min()
 
-        # Derive returns from equity
-        rets = s.pct_change().fillna(0.0)
-        rets.name = "strategy"
-
-        report_path = reports_dir / "quantstats_report.html"
-        qs.reports.html(rets, output=str(report_path), title="Backtest Report")
-        print(f"[backtest] Saved QuantStats report -> {report_path}")
+        summary_txt = f"""
+[backtest] Summary
+  Steps: {steps}
+  Total Return: {total_return * 100:.2f}%
+  Ann. Vol: {ann_vol * 100:.2f}%
+  Sharpe: {sharpe:.2f}
+  Max Drawdown: {abs(dd) * 100:.2f}%
+        """
+        print(summary_txt)
+        summary_path.write_text(summary_txt)
+        logger.info(f"Saved summary: {summary_path}")
     except Exception as e:
-        print(f"[backtest] QuantStats report skipped: {e}")
+        logger.error(f"Summary failed: {e}")
 
+    # QuantStats
+    if qs is not None:
+        try:
+            rets = equity_series.pct_change().fillna(0.0)
+            rets.name = "strategy"
+            report_path = reports_dir / "quantstats_report.html"
+            qs.reports.html(rets, output=str(report_path))
+            logger.info(f"Saved QuantStats report: {report_path}")
+        except Exception as e:
+            logger.error(f"QuantStats failed: {e}")
+    else:
+        logger.info("quantstats not installed; skipped HTML report.")
 
 if __name__ == "__main__":
-    run()
+    main()
+
+

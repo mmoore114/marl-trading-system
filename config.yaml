@@ -1,34 +1,39 @@
 universe:
-  tickers: ["AAPL", "MSFT", "NVDA", "SPY"]
+  tickers: ["AAPL", "MSFT", "NVDA", "SPY"]  # Expand for prototype; file ref for 1000+
   benchmark: "SPY"
 
 data:
   start_date: "2018-01-01"
   end_date: "2025-08-01"
   price_frequency: "1d"
-  source: "yfinance"           # prototype; switch to "eodhd" later
+  source: "yfinance"  # or "eodhd", "ibkr"
 
 eodhd:
   api_key_env: "EODHD_API_KEY"
   rate_limit_per_sec: 4.0
 
+ibkr:
+  host: "localhost"
+  port: 7497
+  client_id: 1
+
 splits:
   train_end: "2023-12-31"
-  val_end:   "2024-12-31"
+  val_end: "2024-12-31"
 
 factors:
   momentum_21d: {window: 21}
   momentum_63d: {window: 63}
-  rsi_14:       {window: 14}
-  vol_21d:      {window: 21}
-  atr_14:       {window: 14}
-  ma_fast_10:   {window: 10}
-  ma_slow_50:   {window: 50}
+  rsi_14: {window: 14}
+  vol_21d: {window: 21}
+  atr_14: {window: 14}
+  ma_fast_10: {window: 10}
+  ma_slow_50: {window: 50}
 
 reward:
-  lambda_tc_bps: 1.0           # cost per 100% turnover (basis points)
-  lambda_sigma:  0.10          # volatility penalty
-  lambda_dd:     0.05          # drawdown penalty
+  lambda_tc_bps: 1.0
+  lambda_sigma: 0.10
+  lambda_dd: 0.05
   turnover_limit_bps: 1000
 
 actions:
@@ -36,13 +41,18 @@ actions:
   max_weight_per_name: 0.10
   cash_node: true
 
+specialists:
+  types: ["technical", "fundamental", "sentiment", "risk"]
+  weights: [0.25, 0.25, 0.25, 0.25]
+
 training:
   algo: "PPO"
   total_timesteps: 300000
   n_envs: 4
   seed: 42
+  multi_agent: true
 
-  # PPO hyperparams (SB3)
+  # PPO hyperparams
   n_steps: 2048
   batch_size: 4096
   gae_lambda: 0.95
@@ -63,6 +73,7 @@ training:
 eval:
   eval_episodes: 5
   eval_freq_steps: 20000
+  metrics: ["sharpe", "drawdown"]
 
 storage:
   local_data_dir: "data"
@@ -71,6 +82,7 @@ storage:
 logging:
   use_mlflow: false
   mlflow_uri: ""
+  use_tensorboard: true
 
 
 
