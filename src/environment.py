@@ -33,6 +33,13 @@ def _load_processed_parquet(symbol: str, proc_dir: Path) -> pd.DataFrame:
         raise KeyError(f"{fp} missing columns {missing}. Re-run feature_engineering.")
     df["date"] = pd.to_datetime(df["date"], errors="coerce")
     df = df.dropna(subset=["date"]).sort_values("date").reset_index(drop=True)
+
+    # Safety: ensure finite numeric values
+    for c in ["ret_1d", "spec_momentum", "spec_meanrev"]:
+        if c in df.columns:
+            df[c] = pd.to_numeric(df[c], errors="coerce")
+            df[c] = df[c].replace([np.inf, -np.inf], np.nan).fillna(0.0)
+
     return df[["date", "ret_1d", "spec_momentum", "spec_meanrev"]].copy()
 
 
@@ -133,14 +140,19 @@ class MultiStrategyEnv(gym.Env):
         act_dim = self.n_assets + (1 if self.cash_node else 0)
         self.action_space = spaces.Box(low=low, high=1.0, shape=(act_dim,), dtype=np.float32)
 
-        # Pre-index by date for fast step()
+        # Pre-index by date for fast step() and ensure finiteness
         self.panel_by_date: Dict[pd.Timestamp, pd.DataFrame] = {}
         for d in self.dates:
-            self.panel_by_date[d] = (
+            panel_d = (
                 self.df.loc[self.df["date"] == d]
                 .set_index("symbol")
                 .reindex(self.symbols)
             )
+            # guarantee no NaNs/Infs in features or returns
+            for c in ["ret_1d", "spec_momentum", "spec_meanrev"]:
+                panel_d[c] = pd.to_numeric(panel_d[c], errors="coerce")
+                panel_d[c] = panel_d[c].replace([np.inf, -np.inf], np.nan).fillna(0.0)
+            self.panel_by_date[d] = panel_d
 
         # Reward knobs
         self.lambda_tc = float(self.cfg["reward"]["lambda_tc_bps"]) / 10000.0
@@ -157,12 +169,16 @@ class MultiStrategyEnv(gym.Env):
             self.prev_w[-1] = 1.0
 
     # -------- helpers
+    @staticmethod
+    def _finite(arr: np.ndarray) -> np.ndarray:
+        # Replace NaN/Inf with 0.0
+        return np.nan_to_num(arr, nan=0.0, posinf=0.0, neginf=0.0).astype(np.float32)
+
     def _obs(self, d: pd.Timestamp) -> Dict[str, np.ndarray]:
         panel = self.panel_by_date[d]
-        return {
-            "momentum": panel["spec_momentum"].to_numpy(np.float32),
-            "meanrev": panel["spec_meanrev"].to_numpy(np.float32),
-        }
+        mom = self._finite(panel["spec_momentum"].to_numpy(np.float32))
+        mr = self._finite(panel["spec_meanrev"].to_numpy(np.float32))
+        return {"momentum": mom, "meanrev": mr}
 
     def _project(self, w: np.ndarray) -> np.ndarray:
         w = np.asarray(w, dtype=np.float32).copy()
@@ -197,7 +213,6 @@ class MultiStrategyEnv(gym.Env):
 
     # -------- Gym API
     def reset(self, *, seed: int | None = None, options: dict | None = None) -> Tuple[Dict[str, np.ndarray], Dict]:
-        # Must return (obs, info) for Gymnasium + SB3 v2.x
         super().reset(seed=seed)
         self.t = 0
         self.portfolio_value = 1.0
@@ -215,7 +230,9 @@ class MultiStrategyEnv(gym.Env):
 
         d = self.dates[self.t]
         panel = self.panel_by_date[d]
+
         asset_rets = panel["ret_1d"].to_numpy(np.float32)
+        asset_rets = self._finite(asset_rets)
         if self.cash_node:
             asset_rets = np.concatenate([asset_rets, np.array([0.0], dtype=np.float32)])
 
@@ -230,12 +247,19 @@ class MultiStrategyEnv(gym.Env):
         vol_pen = self.lambda_sigma * float(np.std(asset_rets))
 
         # Update equity + drawdown
-        self.portfolio_value *= (1.0 + port_ret - tc_cost - vol_pen)
+        pv_next = self.portfolio_value * (1.0 + port_ret - tc_cost - vol_pen)
+        if not np.isfinite(pv_next) or pv_next <= 0:
+            # Safety clamp (treat as flat return if numerical issue)
+            pv_next = self.portfolio_value
+        self.portfolio_value = pv_next
         self.peak_value = max(self.peak_value, self.portfolio_value)
-        dd = (self.peak_value - self.portfolio_value) / self.peak_value
+        dd = (self.peak_value - self.portfolio_value) / max(self.peak_value, 1e-12)
         dd_pen = self.lambda_dd * float(dd)
 
-        reward = port_ret - tc_cost - vol_pen - dd_pen
+        reward = float(port_ret - tc_cost - vol_pen - dd_pen)
+        if not np.isfinite(reward):
+            reward = 0.0
+
         self.prev_w = w
 
         self.t += 1
@@ -244,6 +268,7 @@ class MultiStrategyEnv(gym.Env):
         info = {"turnover": turnover, "tc_cost": tc_cost, "dd": float(dd), "port_ret": port_ret}
         next_obs = self._obs(self.dates[min(self.t, len(self.dates) - 1)])
         return next_obs, reward, terminated, truncated, info
+
 
 
 
