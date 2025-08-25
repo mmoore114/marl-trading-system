@@ -1,59 +1,69 @@
 import os
 import yaml
 import torch
-from stable_baselines3 import PPO
-from stable_baselines3.common.vec_env import DummyVecEnv
-from stable_baselines3.common.env_util import make_vec_env
+import ray
+from ray import air, tune
+from ray.rllib.agents.ppo import PPOTrainer
+from ray.rllib.policy.policy import PolicySpec
+from src.environment import TradingEnv
+import logging
 
-from src.environment import MultiStrategyEnv
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 def read_config():
     with open("config.yaml", "r") as f:
         return yaml.safe_load(f)
 
-def make_env(mode):
-    def _init():
-        return MultiStrategyEnv(mode=mode)
-    return _init
-
 def main():
     cfg = read_config()
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    print(f"Using {device} device")
+    logger.info(f"Using {device} device")
+
+    ray.init(num_gpus=1 if device == "cuda" else 0, ignore_reinit_error=True)
 
     tr_cfg = cfg.get("training", {})
-    total_timesteps = int(tr_cfg.get("total_timesteps", 150000))
-    n_envs = int(tr_cfg.get("n_envs", 4))
-    seed = int(tr_cfg.get("seed", 42))
+    seed = tr_cfg.get("seed", 42)
 
-    # Vec env
-    env = make_vec_env(make_env("train"), n_envs=n_envs, seed=seed, vec_env_cls=DummyVecEnv)
+    policies = {
+        a: PolicySpec() for a in ['technical', 'fundamental', 'sentiment', 'risk', 'portfolio']
+    }
+    policy_mapping_fn = lambda agent_id: agent_id
 
-    policy_kwargs = tr_cfg.get("policy_kwargs", {})
-    ppo_kwargs = dict(
-        n_steps=int(tr_cfg.get("n_steps", 2048)),
-        batch_size=int(tr_cfg.get("batch_size", 4096)),
-        gae_lambda=float(tr_cfg.get("gae_lambda", 0.95)),
-        gamma=float(tr_cfg.get("gamma", 0.99)),
-        ent_coef=float(tr_cfg.get("ent_coef", 0.005)),
-        vf_coef=float(tr_cfg.get("vf_coef", 0.5)),
-        max_grad_norm=float(tr_cfg.get("max_grad_norm", 0.5)),
-        clip_range=float(tr_cfg.get("clip_range", 0.2)),
-        target_kl=float(tr_cfg.get("target_kl", 0.02)),
-        learning_rate=float(tr_cfg.get("learning_rate", 3e-4)),
-        policy_kwargs=policy_kwargs,
-        verbose=1,
-        device=device,
-        seed=seed,
+    config = {
+        "env": TradingEnv,
+        "env_config": {"mode": "train"},
+        "multiagent": {
+            "policies": policies,
+            "policy_mapping_fn": policy_mapping_fn,
+        },
+        "framework": "torch",
+        "num_gpus": 1 if device == "cuda" else 0,
+        "num_workers": tr_cfg.get("n_envs", 4),
+        "lr": tr_cfg.get("learning_rate", 3e-4),
+        "seed": seed,
+        "log_level": "INFO",
+        "evaluation_interval": 10,
+        "evaluation_num_workers": 1,
+        "evaluation_config": {"env_config": {"mode": "test"}},
+    }
+
+    tuner = tune.Tuner(
+        PPOTrainer,
+        param_space=config,
+        run_config=air.RunConfig(
+            stop={"training_iteration": tr_cfg.get("total_timesteps", 150000) // 2048},  # Approx
+            verbose=1,
+            checkpoint_config=air.CheckpointConfig(checkpoint_frequency=10),
+            storage_path="models/ray_checkpoints",
+        ),
     )
 
-    model = PPO("MlpPolicy", env, **ppo_kwargs)
-    model.learn(total_timesteps=total_timesteps)
+    results = tuner.fit()
+    best_checkpoint = results.get_best_result(metric="episode_reward_mean", mode="max").checkpoint
+    logger.info(f"Best checkpoint: {best_checkpoint.path}")
 
-    os.makedirs("models", exist_ok=True)
-    out = os.path.join("models", "ppo_specialist_super_agent_final.zip")
-    model.save(out)
-    print(f"Training complete. Saved model to {out}")
+    ray.shutdown()
 
 if __name__ == "__main__":
     main()
