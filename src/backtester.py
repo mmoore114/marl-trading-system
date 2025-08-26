@@ -1,141 +1,122 @@
-from __future__ import annotations
-
 import argparse
-import sys
-from pathlib import Path
-from typing import Tuple, Optional
-
+import yaml
 import numpy as np
 import pandas as pd
 import logging
-from stable_baselines3 import PPO
-from ray.rllib.policy.policy import PolicySpec  # For MARL if needed
+from pathlib import Path
+import torch
 
-try:
-    import quantstats as qs
-except ImportError:
-    qs = None
+# --- FIX: Import the correct Ray RLlib Algorithm class ---
+from ray.rllib.algorithms.algorithm import Algorithm
 
 from src.environment import TradingEnv
 
-logging.basicConfig(level=logging.INFO)
+# --- FIX: Use QuantStats if available ---
+try:
+    import quantstats as qs
+    QUANTSTATS_AVAILABLE = True
+except ImportError:
+    QUANTSTATS_AVAILABLE = False
+
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
-def _ensure_reports_dir() -> Path:
-    d = Path("reports")
-    d.mkdir(parents=True, exist_ok=True)
-    return d
-
-def _load_model(model_path: Path) -> PPO:
-    if not model_path.exists():
-        logger.error(f"Model not found: {model_path}")
-        sys.exit(1)
-    logger.info(f"Loading model: {model_path}")
-    return PPO.load(str(model_path), device="cpu")
+# --- FIX: Use robust pathing ---
+ROOT = Path(__file__).resolve().parents[1]
+REPORTS_DIR = ROOT / "reports"
+REPORTS_DIR.mkdir(parents=True, exist_ok=True)
 
 def main():
-    parser = argparse.ArgumentParser(description="Run backtest with trained PPO model.")
-    parser.add_argument("--model", default="models/ppo_specialist_super_agent_final.zip", help="SB3 .zip path.")
-    parser.add_argument("--max-steps", type=int, default=250000, help="Step cap.")
-    parser.add_argument("--progress-every", type=int, default=500, help="Log every N steps.")
-    parser.add_argument("--write-every", type=int, default=250, help="Save CSV every N steps.")
+    parser = argparse.ArgumentParser(description="Run backtest with a trained RLlib agent.")
+    parser.add_argument(
+        "--checkpoint_dir",
+        required=True,
+        help="Path to the Ray RLlib checkpoint directory.",
+    )
     args = parser.parse_args()
 
-    reports_dir = _ensure_reports_dir()
+    checkpoint_path = Path(args.checkpoint_dir)
+    if not checkpoint_path.exists():
+        logger.error(f"Checkpoint directory not found: {checkpoint_path}")
+        return
 
-    model_path = Path(args.model)
-    model = _load_model(model_path)
-    env = TradingEnv(mode="test")
+    logger.info(f"Loading agent from checkpoint: {checkpoint_path}")
+    # --- FIX: Load agent using Algorithm.from_checkpoint ---
+    agent = Algorithm.from_checkpoint(checkpoint_path)
 
-    obs = env.reset()[0]  # obs dict
-    rewards = []
-    equities = []
+    logger.info("Initializing test environment...")
+    # --- FIX: Pass env_config correctly ---
+    env = TradingEnv(env_config={"mode": "test"})
+    
+    # --- FIX: Get all RL Modules for each policy ---
+    modules = {policy_id: agent.get_policy(policy_id).model for policy_id in env.action_space.keys()}
+
+    obs, info = env.reset()
+    terminated = {"__all__": False}
+    
+    portfolio_values = [env.portfolio_value]
     steps = 0
 
-    tmp_eq_path = reports_dir / "backtest_equity_curve.tmp.csv"
-    final_eq_path = reports_dir / "backtest_equity_curve.csv"
-    summary_path = reports_dir / "summary.txt"
+    logger.info("--- Starting Backtest ---")
+    while not terminated["__all__"]:
+        actions = {}
+        # --- FIX: New action computation loop using RL Modules ---
+        for agent_id, agent_obs in obs.items():
+            # Convert observation to a batch of 1 and a torch tensor
+            obs_tensor = torch.from_numpy(np.expand_dims(agent_obs, axis=0)).float()
+            
+            # Use the new forward_inference method
+            action_dist_inputs, _ = modules[agent_id].forward_inference({"obs": obs_tensor})
+            
+            # Convert action back to numpy and remove the batch dimension
+            actions[agent_id] = action_dist_inputs.cpu().numpy()[0]
 
-    logger.info("Running backtest...")
+        obs, rewards, terminated, truncated, info = env.step(actions)
+        
+        portfolio_values.append(env.portfolio_value)
+        steps += 1
+        if steps % 252 == 0: # Log roughly once per trading year
+            logger.info(f"Step: {steps}, Portfolio Value: ${env.portfolio_value:,.2f}")
 
-    try:
-        while True:
-            actions = {a: model.predict(obs[a], deterministic=True)[0] for a in env.agents}
-            obs, reward, terminated, truncated, info = env.step(actions)
-            rewards.append(list(reward.values())[0])  # Assume shared reward
+    logger.info(f"--- Backtest Complete ---")
+    logger.info(f"Finished after {steps} steps. Final Portfolio Value: ${portfolio_values[-1]:,.2f}")
+    
+    # --- Reporting ---
+    equity_curve = pd.Series(portfolio_values, index=pd.to_datetime(env.dates[:len(portfolio_values)]))
+    returns = equity_curve.pct_change().dropna()
+    
+    equity_curve.to_csv(REPORTS_DIR / "backtest_equity_curve.csv", header=['equity'])
+    logger.info(f"Saved equity curve to: {REPORTS_DIR / 'backtest_equity_curve.csv'}")
 
-            eq = env._get_portfolio_value(np.array([env.frames[s].iloc[env.current_step]['Close'] for s in env.sym_list]))
-            if eq is not None:
-                equities.append(eq)
+    total_return = (equity_curve.iloc[-1] / equity_curve.iloc[0]) - 1
+    annualized_return = (1 + total_return) ** (252 / len(equity_curve)) - 1 if len(equity_curve) > 0 else 0
+    annualized_vol = returns.std() * np.sqrt(252)
+    sharpe_ratio = annualized_return / annualized_vol if annualized_vol != 0 else 0
+    max_drawdown = (equity_curve / equity_curve.cummax() - 1).min()
 
-            steps += 1
+    summary_txt = f"""
+    --- Backtest Summary ---
+    Period: {env.dates[0].strftime('%Y-%m-%d')} to {env.dates[-1].strftime('%Y-%m-%d')}
+    
+    Final Portfolio Value: ${equity_curve.iloc[-1]:,.2f}
+    Total Return: {total_return:.2%}
+    Annualized Return: {annualized_return:.2%}
+    Annualized Volatility: {annualized_vol:.2%}
+    Sharpe Ratio: {sharpe_ratio:.2f}
+    Max Drawdown: {max_drawdown:.2%}
+    """
+    print(summary_txt)
+    (REPORTS_DIR / "summary.txt").write_text(summary_txt)
+    logger.info(f"Saved summary to: {REPORTS_DIR / 'summary.txt'}")
 
-            if steps % args.progress_every == 0:
-                logger.info(f"Progress: {steps} steps")
-
-            if steps % args.write_every == 0 and equities:
-                pd.Series(equities, name="equity").to_csv(tmp_eq_path, index=False)
-
-            if any(terminated.values()):
-                logger.info(f"Episode finished after {steps} steps.")
-                break
-
-            if steps >= args.max_steps:
-                logger.info(f"Reached max_steps={args.max_steps}.")
-                break
-
-    except KeyboardInterrupt:
-        logger.info("Interrupted. Saving outputs...")
-
-    # Equity series
-    if equities:
-        equity_series = pd.Series(equities, name="equity")
+    if QUANTSTATS_AVAILABLE:
+        report_path = str(REPORTS_DIR / "quantstats_report.html")
+        qs.reports.html(returns, output=report_path, title="MARL Agent Backtest")
+        logger.info(f"Saved QuantStats HTML report to: {report_path}")
     else:
-        rets = pd.Series(rewards, name="ret").fillna(0.0)
-        equity_series = (1.0 + rets).cumprod().rename("equity")
+        logger.warning("QuantStats not installed. Skipping HTML report generation.")
 
-    equity_series.to_csv(final_eq_path, header=True, index=False)
-    logger.info(f"Saved equity curve: {final_eq_path}")
-
-    if tmp_eq_path.exists():
-        tmp_eq_path.unlink()
-
-    # Summary
-    try:
-        rets = equity_series.pct_change().fillna(0.0)
-        total_return = (1 + rets).prod() - 1
-        ann_vol = rets.std() * np.sqrt(252)
-        sharpe = (rets.mean() * 252) / (ann_vol + 1e-12)
-        dd = (equity_series / equity_series.cummax() - 1.0).min()
-
-        summary_txt = f"""
-[backtest] Summary
-  Steps: {steps}
-  Total Return: {total_return * 100:.2f}%
-  Ann. Vol: {ann_vol * 100:.2f}%
-  Sharpe: {sharpe:.2f}
-  Max Drawdown: {abs(dd) * 100:.2f}%
-        """
-        print(summary_txt)
-        summary_path.write_text(summary_txt)
-        logger.info(f"Saved summary: {summary_path}")
-    except Exception as e:
-        logger.error(f"Summary failed: {e}")
-
-    # QuantStats
-    if qs is not None:
-        try:
-            rets = equity_series.pct_change().fillna(0.0)
-            rets.name = "strategy"
-            report_path = reports_dir / "quantstats_report.html"
-            qs.reports.html(rets, output=str(report_path))
-            logger.info(f"Saved QuantStats report: {report_path}")
-        except Exception as e:
-            logger.error(f"QuantStats failed: {e}")
-    else:
-        logger.info("quantstats not installed; skipped HTML report.")
 
 if __name__ == "__main__":
     main()
-
 

@@ -48,7 +48,7 @@ specialists:
 training:
   algo: "PPO"
   total_timesteps: 300000
-  n_envs: 4
+  n_envs: 2
   seed: 42
   multi_agent: true
 
