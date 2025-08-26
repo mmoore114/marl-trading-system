@@ -6,12 +6,9 @@ import logging
 from pathlib import Path
 import torch
 
-# --- FIX: Import the correct Ray RLlib Algorithm class ---
 from ray.rllib.algorithms.algorithm import Algorithm
-
 from src.environment import TradingEnv
 
-# --- FIX: Use QuantStats if available ---
 try:
     import quantstats as qs
     QUANTSTATS_AVAILABLE = True
@@ -21,7 +18,6 @@ except ImportError:
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
-# --- FIX: Use robust pathing ---
 ROOT = Path(__file__).resolve().parents[1]
 REPORTS_DIR = ROOT / "reports"
 REPORTS_DIR.mkdir(parents=True, exist_ok=True)
@@ -41,15 +37,12 @@ def main():
         return
 
     logger.info(f"Loading agent from checkpoint: {checkpoint_path}")
-    # --- FIX: Load agent using Algorithm.from_checkpoint ---
     agent = Algorithm.from_checkpoint(checkpoint_path)
 
     logger.info("Initializing test environment...")
-    # --- FIX: Pass env_config correctly ---
     env = TradingEnv(env_config={"mode": "test"})
     
-    # --- FIX: Get all RL Modules for each policy ---
-    modules = {policy_id: agent.get_policy(policy_id).model for policy_id in env.action_space.keys()}
+    modules = {module_id: agent.get_module(module_id) for module_id in env.action_space.keys()}
 
     obs, info = env.reset()
     terminated = {"__all__": False}
@@ -60,28 +53,26 @@ def main():
     logger.info("--- Starting Backtest ---")
     while not terminated["__all__"]:
         actions = {}
-        # --- FIX: New action computation loop using RL Modules ---
         for agent_id, agent_obs in obs.items():
-            # Convert observation to a batch of 1 and a torch tensor
             obs_tensor = torch.from_numpy(np.expand_dims(agent_obs, axis=0)).float()
             
-            # Use the new forward_inference method
-            action_dist_inputs, _ = modules[agent_id].forward_inference({"obs": obs_tensor})
+            output_dict = modules[agent_id].forward_inference({"obs": obs_tensor})
+            raw_action = output_dict['action_dist_inputs'].cpu().numpy()[0]
             
-            # Convert action back to numpy and remove the batch dimension
-            actions[agent_id] = action_dist_inputs.cpu().numpy()[0]
+            # --- FIX: Extract only the 'mean' part of the action distribution ---
+            num_actions = env.action_space[agent_id].shape[0]
+            actions[agent_id] = raw_action[:num_actions]
 
         obs, rewards, terminated, truncated, info = env.step(actions)
         
         portfolio_values.append(env.portfolio_value)
         steps += 1
-        if steps % 252 == 0: # Log roughly once per trading year
+        if steps % 252 == 0:
             logger.info(f"Step: {steps}, Portfolio Value: ${env.portfolio_value:,.2f}")
 
     logger.info(f"--- Backtest Complete ---")
     logger.info(f"Finished after {steps} steps. Final Portfolio Value: ${portfolio_values[-1]:,.2f}")
     
-    # --- Reporting ---
     equity_curve = pd.Series(portfolio_values, index=pd.to_datetime(env.dates[:len(portfolio_values)]))
     returns = equity_curve.pct_change().dropna()
     
