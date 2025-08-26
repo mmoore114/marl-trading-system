@@ -92,4 +92,4 @@ The baseline agent is not profitable, which is expected. The focus now shifts fr
     * **Feature Engineering**: Add/remove/modify factors in `config.yaml` and `feature_engineering.py`.
     * **Reward Shaping**: Adjust the reward penalties in `config.yaml` to encourage different agent behaviors.
     * **Hyperparameter Tuning**: Use a tool like Optuna to systematically find better model settings than the defaults.
-3.  **Integrate New Data**: Once the EODHD package is available, proceed with `sentiment_pipeline.py` and add fundamental data to the feature engineering process..
+3.  **Integrate New Data**: Once the EODHD package is available, proceed with `sentiment_pipeline.py` and add fundamental data to the feature engineering process.

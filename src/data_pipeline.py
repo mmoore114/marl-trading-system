@@ -6,6 +6,7 @@ import yaml
 import yfinance as yf
 import requests
 import logging
+import os
 from tenacity import retry, stop_after_attempt, wait_fixed
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
