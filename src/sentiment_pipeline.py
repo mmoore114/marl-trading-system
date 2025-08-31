@@ -1,6 +1,7 @@
 import os
 import yaml
 import pandas as pd
+import numpy as np
 from pathlib import Path
 from dotenv import load_dotenv
 from newsapi import NewsApiClient
@@ -11,17 +12,17 @@ import time
 import logging
 from tenacity import retry, stop_after_attempt, wait_fixed
 from joblib import Parallel, delayed
+from src.data_pipeline import read_config, get_universe
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 def initialize_services():
     try:
-        with open("config.yaml", "r") as f:
-            config = yaml.safe_load(f)
-        TICKERS = config['universe']['tickers']
-    except FileNotFoundError:
-        logger.error("config.yaml not found.")
+        cfg = read_config()
+        TICKERS = get_universe(cfg)
+    except Exception as e:
+        logger.error(f"Failed to load config or universe: {e}")
         raise
 
     load_dotenv()

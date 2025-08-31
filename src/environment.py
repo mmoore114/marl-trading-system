@@ -63,10 +63,11 @@ def _cache_and_load_data(tickers: list[str], proc_dir: Path, cache_dir: Path) ->
         
         price_df = full_df.loc[:, pd.IndexSlice[:, "adj_close"]]
         feature_df = full_df.drop(columns=["open", "high", "low", "close", "adj_close", "volume"], level=1)
-        
+
+        # Use float32 to reduce memory/IO footprint
         np.save(dates_cache_fp, common_dates.to_numpy())
-        np.save(features_cache_fp, feature_df.to_numpy())
-        np.save(prices_cache_fp, price_df.to_numpy())
+        np.save(features_cache_fp, feature_df.to_numpy(dtype=np.float32))
+        np.save(prices_cache_fp, price_df.to_numpy(dtype=np.float32))
         with open(final_tickers_fp, 'w') as f:
             f.write(','.join(final_tickers))
         logger.info(f"Successfully cached data for {len(final_tickers)} tickers to {cache_dir}")
@@ -96,6 +97,13 @@ class SingleAgentTradingEnv(gym.Env):
         self.initial_cash = 100_000.0
         self.reward_config = CONFIG["reward"]
         self.tc_bps = self.reward_config["lambda_tc_bps"]
+        self.turnover_limit = float(self.reward_config.get("turnover_limit_bps", 0)) / 10000.0 if self.reward_config.get("turnover_limit_bps") else None
+
+        # Action constraints
+        actions_cfg = CONFIG.get("actions", {}) or {}
+        self.allow_short = bool(actions_cfg.get("allow_short", False))
+        self.max_weight_per_name = float(actions_cfg.get("max_weight_per_name", 1.0))
+        self.cash_node = bool(actions_cfg.get("cash_node", True))
         
         self._split_data()
 
@@ -147,23 +155,40 @@ class SingleAgentTradingEnv(gym.Env):
 
     def step(self, action: np.ndarray):
         current_prices = self.prices[self.current_step]
-        target_weights = np.exp(action) / np.sum(np.exp(action))
-        
-        prev_weights = self.portfolio_weights
-        turnover = np.sum(np.abs(target_weights - prev_weights)) / 2
+
+        # Map raw action to target weights. For now, long-only via softmax.
+        if self.allow_short:
+            logger.warning("allow_short=True is not yet supported; falling back to long-only softmax mapping.")
+        exps = np.exp(action - np.max(action))  # numerical stability
+        target_weights = exps / np.sum(exps)
+
+        prev_weights = self.portfolio_weights.copy()
+
+        # Apply per-name cap and cash policy
+        target_weights = self._apply_weight_constraints(target_weights)
+
+        # Enforce turnover limit by scaling move toward target if necessary
+        if self.turnover_limit is not None and self.turnover_limit > 0:
+            turnover = np.sum(np.abs(target_weights - prev_weights)) / 2.0
+            if turnover > self.turnover_limit and turnover > 0:
+                k = self.turnover_limit / turnover
+                target_weights = prev_weights + k * (target_weights - prev_weights)
+                target_weights = self._apply_weight_constraints(target_weights)
+
+        # Transaction cost on executed turnover
+        turnover = np.sum(np.abs(target_weights - prev_weights)) / 2.0
         transaction_cost = turnover * self.portfolio_value * (self.tc_bps / 10000)
-        
         self.portfolio_value -= transaction_cost
-        
+
+        # Price evolution on previous asset holdings (excluding cash)
         next_prices = self.prices[self.current_step + 1]
         asset_weights = prev_weights[:-1]
-        
         price_changes = np.divide(next_prices, current_prices, out=np.ones_like(current_prices), where=current_prices!=0)
         portfolio_return = np.dot(asset_weights, price_changes - 1)
-        
         self.portfolio_value *= (1 + portfolio_return)
-        
-        self.portfolio_weights = target_weights
+
+        # Update to new portfolio weights
+        self.portfolio_weights = target_weights.astype(np.float32)
         reward = self._calculate_reward()
         self.current_step += 1
         
@@ -190,3 +215,32 @@ class SingleAgentTradingEnv(gym.Env):
         drawdown_penalty = self.reward_config["lambda_dd"] * abs(drawdown)
         risk_penalty = self.reward_config["lambda_sigma"] * np.std(self.portfolio_weights[:-1])
         return float(step_return - drawdown_penalty - risk_penalty)
+
+    # --- Internal helpers ---
+    def _apply_weight_constraints(self, weights: np.ndarray) -> np.ndarray:
+        """Apply long-only, per-name cap, and cash-node policy. Ensures sum=1 and >=0."""
+        w = np.clip(weights.astype(np.float64), 0.0, 1.0)
+        asset_w = w[:-1].copy()
+        cash_w = w[-1]
+
+        # Per-name cap
+        cap = min(max(self.max_weight_per_name, 0.0), 1.0)
+        if cap < 1.0:
+            asset_w = np.minimum(asset_w, cap)
+
+        if self.cash_node:
+            s = asset_w.sum()
+            if s > 1.0:
+                asset_w = asset_w / s
+                cash_w = 0.0
+            else:
+                cash_w = 1.0 - s
+            w_out = np.concatenate([asset_w, np.array([cash_w], dtype=np.float64)])
+        else:
+            # No dedicated cash: renormalize whole vector to sum 1
+            w_out = np.concatenate([asset_w, np.array([cash_w], dtype=np.float64)])
+            s = w_out.sum()
+            if s > 0:
+                w_out = w_out / s
+
+        return w_out.astype(np.float32)

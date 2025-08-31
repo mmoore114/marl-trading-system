@@ -95,6 +95,9 @@ def process_file(file_path: Path, factors_config: dict):
         # Calculate features based on the config
         df_features = calculate_factors(df, factors_config)
 
+        # Normalize feature columns for stable learning
+        df_features = normalize_features(df_features)
+
         # Drop rows with NaN values resulting from window calculations
         df_features.dropna(inplace=True)
 
@@ -104,7 +107,9 @@ def process_file(file_path: Path, factors_config: dict):
             )
             return
 
-        # Save to a more efficient format
+        # Save to a more efficient format (float32)
+        float_cols = df_features.select_dtypes(include=[np.floating]).columns
+        df_features[float_cols] = df_features[float_cols].astype(np.float32)
         output_path = PROC_DIR / f"{file_path.stem}.parquet"
         df_features.to_parquet(output_path, index=False)
         logger.info(f"Successfully saved processed file to {output_path}")
@@ -136,3 +141,25 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+
+# --- Helpers ---
+def normalize_features(df: pd.DataFrame) -> pd.DataFrame:
+    """Apply simple normalization: RSI->0..1; others rolling z-score then tanh clip."""
+    out = df.copy()
+    base_cols = {"date", "open", "high", "low", "close", "adj_close", "volume"}
+    factor_cols = [c for c in out.columns if c not in base_cols]
+
+    for col in factor_cols:
+        series = out[col]
+        if series.dtype.kind not in {"f", "i"}:
+            continue
+        if "rsi" in col:
+            out[col] = (series / 100.0).clip(0.0, 1.0)
+        else:
+            mean = series.rolling(window=252, min_periods=20).mean()
+            std = series.rolling(window=252, min_periods=20).std()
+            z = (series - mean) / std
+            out[col] = np.tanh(z.fillna(0.0))
+
+    return out
