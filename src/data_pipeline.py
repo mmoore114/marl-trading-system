@@ -38,16 +38,31 @@ def read_config() -> dict:
         logger.error(f"Configuration file not found at: {CONFIG_FP}")
         raise
 
-
 def get_universe(cfg: dict) -> List[str]:
     """Extracts and formats the list of tickers from the config."""
     uni = cfg.get("universe", {}) or {}
-    tickers = [str(t).upper().strip() for t in (uni.get("tickers") or [])]
+    tickers_config = uni.get("tickers")
+
+    if isinstance(tickers_config, str):
+        # If it's a string, assume it's a file path relative to the project root
+        ticker_file = ROOT / tickers_config
+        if not ticker_file.exists():
+            raise FileNotFoundError(f"Ticker file not found: {ticker_file}")
+        tickers = pd.read_csv(ticker_file).squeeze("columns").tolist()
+        logger.info(f"Loaded {len(tickers)} tickers from {ticker_file}")
+    elif isinstance(tickers_config, list):
+        # If it's a list, use it directly
+        tickers = tickers_config
+    else:
+        tickers = []
+
+    # Clean up tickers and ensure benchmark is included
+    tickers = [str(t).upper().strip() for t in tickers]
     benchmark = str((uni.get("benchmark") or "SPY")).upper().strip()
     if benchmark and benchmark not in tickers:
         tickers.append(benchmark)
+        
     return list(sorted(set(tickers)))
-
 
 def get_date_range(cfg: dict) -> Tuple[str, str]:
     """Extracts and validates the date range from the config."""

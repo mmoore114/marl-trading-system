@@ -1,5 +1,5 @@
 universe:
-  tickers: ["AAPL", "MSFT", "NVDA", "SPY"]  # Expand for prototype; file ref for 1000+
+  tickers:  "sp500_tickers.csv" # Expand for prototype; file ref for 1000+
   benchmark: "SPY"
 
 data:
@@ -31,7 +31,7 @@ factors:
   ma_slow_50: {window: 50}
 
 reward:
-  lambda_tc_bps: 1.0
+  lambda_tc_bps: 2.0
   lambda_sigma: 0.10
   lambda_dd: 0.05
   turnover_limit_bps: 1000

@@ -1,5 +1,3 @@
-from __future__ import annotations
-
 import logging
 from pathlib import Path
 
@@ -16,75 +14,97 @@ with open(CONFIG_PATH, "r") as f:
     CONFIG = yaml.safe_load(f)
 
 PROC_DIR = ROOT / CONFIG["storage"]["local_data_dir"] / "processed"
+CACHE_DIR = ROOT / CONFIG["storage"]["local_data_dir"] / "cache"
+CACHE_DIR.mkdir(parents=True, exist_ok=True)
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
 
 # --- Helper Functions ---
-def _load_and_prepare_data(tickers: list[str], proc_dir: Path) -> tuple[pd.Index, np.ndarray, np.ndarray]:
-    """Loads all processed data, finds common dates, and converts to NumPy arrays for performance."""
-    frames = {}
-    for ticker in tickers:
-        fp = proc_dir / f"{ticker}.parquet"
-        if not fp.exists():
-            raise FileNotFoundError(f"Missing processed file: {fp}. Please run feature_engineering.py")
-        frames[ticker] = pd.read_parquet(fp).set_index("date")
+def _cache_and_load_data(tickers: list[str], proc_dir: Path, cache_dir: Path) -> tuple[list[str], pd.DatetimeIndex, np.ndarray, np.ndarray]:
+    """
+    Checks for cached NumPy arrays. If not present, creates them by loading all data,
+    filtering for sufficient history, creating a master date index, and forward-filling.
+    """
+    ticker_hash = str(hash(tuple(sorted(tickers))))
+    dates_cache_fp = cache_dir / f"dates_{ticker_hash}.npy"
+    features_cache_fp = cache_dir / f"features_{ticker_hash}.npy"
+    prices_cache_fp = cache_dir / f"prices_{ticker_hash}.npy"
+    final_tickers_fp = cache_dir / f"tickers_{ticker_hash}.txt"
 
-    # Find common dates across all tickers
-    common_dates = None
-    for df in frames.values():
-        if common_dates is None:
-            common_dates = df.index
-        else:
-            common_dates = common_dates.intersection(df.index)
+    if not all([dates_cache_fp.exists(), features_cache_fp.exists(), prices_cache_fp.exists(), final_tickers_fp.exists()]):
+        logger.info("Cache not found for this ticker set. Pre-processing and caching data arrays...")
+        
+        frames = {}
+        min_data_points = 252 * 5  # Require at least 5 years of data
+        logger.info(f"Screening {len(tickers)} tickers for >= {min_data_points} data points...")
+
+        for ticker in tickers:
+            fp = proc_dir / f"{ticker}.parquet"
+            if fp.exists():
+                df = pd.read_parquet(fp).set_index("date")
+                if len(df) >= min_data_points:
+                    frames[ticker] = df
+
+        if not frames:
+            raise ValueError("No tickers with sufficient data history found.")
+        
+        logger.info(f"Found {len(frames)} tickers with sufficient history.")
+
+        # Create a master date index from the intersection of all valid frames
+        common_dates = None
+        for df in frames.values():
+            common_dates = df.index if common_dates is None else common_dates.intersection(df.index)
+
+        final_tickers = sorted(frames.keys())
+        full_df = pd.concat({ticker: df.loc[common_dates] for ticker, df in frames.items()}, axis=1)
+        full_df.ffill(inplace=True)
+        full_df.bfill(inplace=True)
+        
+        price_df = full_df.loc[:, pd.IndexSlice[:, "adj_close"]]
+        feature_df = full_df.drop(columns=["open", "high", "low", "close", "adj_close", "volume"], level=1)
+        
+        np.save(dates_cache_fp, common_dates.to_numpy())
+        np.save(features_cache_fp, feature_df.to_numpy())
+        np.save(prices_cache_fp, price_df.to_numpy())
+        with open(final_tickers_fp, 'w') as f:
+            f.write(','.join(final_tickers))
+        logger.info(f"Successfully cached data for {len(final_tickers)} tickers to {cache_dir}")
+
+    logger.info("Loading data from cache using memory mapping...")
+    all_dates = pd.to_datetime(np.load(dates_cache_fp))
+    all_features = np.load(features_cache_fp, mmap_mode='r')
+    all_prices = np.load(prices_cache_fp, mmap_mode='r')
+    with open(final_tickers_fp, 'r') as f:
+        final_tickers = f.read().strip().split(',')
     
-    # Concatenate into a single DataFrame, then split into features and prices
-    full_df = pd.concat({ticker: df.loc[common_dates] for ticker, df in frames.items()}, axis=1)
-    
-    # Extract features and prices into NumPy arrays for fast slicing
-    # Using 'adj_close' for price data to base portfolio value on
-    price_df = full_df.loc[:, pd.IndexSlice[:, "adj_close"]]
-    feature_df = full_df.drop(columns="adj_close", level=1) # Drop adj_close from features
-    
-    return common_dates, feature_df.to_numpy(), price_df.to_numpy()
+    return final_tickers, pd.DatetimeIndex(all_dates), all_features, all_prices
 
 # --- Environment Class ---
 class SingleAgentTradingEnv(gym.Env):
-    """A single-agent trading environment for portfolio optimization."""
-    
     def __init__(self, env_config: dict | None = None):
         super().__init__()
         env_config = env_config or {}
 
-        # --- Load Data ---
-        self.tickers = CONFIG["universe"]["tickers"]
+        initial_tickers = sorted([p.stem for p in PROC_DIR.glob("*.parquet")])
+        
+        self.tickers, self.all_dates, self.all_features, self.all_prices = _cache_and_load_data(initial_tickers, PROC_DIR, CACHE_DIR)
         self.num_assets = len(self.tickers)
-        self.all_dates, self.all_features, self.all_prices = _load_and_prepare_data(self.tickers, PROC_DIR)
-
-        # --- Environment Configuration ---
+        
         self.mode = env_config.get("mode", "train")
         self.lookback_window = env_config.get("lookback_window", 30)
         self.initial_cash = 100_000.0
-
-        # --- Get Config Parameters ---
         self.reward_config = CONFIG["reward"]
         self.tc_bps = self.reward_config["lambda_tc_bps"]
         
-        # --- Data Splitting for Train/Val/Test ---
         self._split_data()
 
-        # --- Define Spaces ---
-        num_features_total = self.all_features.shape[1]
-        market_obs_size = self.lookback_window * num_features_total
+        num_features_per_asset = self.all_features.shape[1] // self.num_assets
+        market_obs_size = self.lookback_window * (num_features_per_asset * self.num_assets)
         portfolio_obs_size = self.num_assets + 1
-        self.observation_space = spaces.Box(
-            low=-np.inf, 
-            high=np.inf, 
-            shape=(market_obs_size + portfolio_obs_size,), 
-            dtype=np.float32
-        )
+        self.observation_space = spaces.Box(low=-np.inf, high=np.inf, shape=(market_obs_size + portfolio_obs_size,), dtype=np.float32)
         self.action_space = spaces.Box(low=-1.0, high=1.0, shape=(self.num_assets + 1,), dtype=np.float32)
-
+    
     def _split_data(self):
         train_end_date = pd.to_datetime(CONFIG["splits"]["train_end"])
         val_end_date = pd.to_datetime(CONFIG["splits"]["val_end"])
@@ -93,19 +113,19 @@ class SingleAgentTradingEnv(gym.Env):
         val_mask = (self.all_dates > train_end_date) & (self.all_dates <= val_end_date)
         test_mask = self.all_dates > val_end_date
         
-        if self.mode == "train":
-            mask = train_mask
-        elif self.mode == "validation":
-            mask = val_mask
-        else: # test
-            mask = test_mask
+        mask = train_mask if self.mode == "train" else (val_mask if self.mode == "validation" else test_mask)
             
         self.dates = self.all_dates[mask]
-        self.features = self.all_features[mask]
-        self.prices = self.all_prices[mask]
+        
+        start_idx = self.all_dates.get_loc(self.dates[0])
+        end_idx = self.all_dates.get_loc(self.dates[-1]) + 1
+        
+        self.features = self.all_features[start_idx:end_idx]
+        self.prices = self.all_prices[start_idx:end_idx]
         
         self.max_steps = len(self.dates) - 2 
         if self.max_steps <= self.lookback_window:
+            logger.error(f"Partition '{self.mode}' has only {len(self.dates)} dates, which is not enough for a lookback of {self.lookback_window}.")
             raise ValueError("Not enough data in the selected partition for the lookback window.")
 
     def reset(self, *, seed=None, options=None):
@@ -122,9 +142,7 @@ class SingleAgentTradingEnv(gym.Env):
         self.terminated = False
         self.truncated = False
         
-        logger.info(f"Environment reset. Starting at step {self.current_step}. Total steps in episode: {self.max_steps - self.lookback_window}")
-        obs = self._get_obs()
-        info = self._get_info()
+        obs, info = self._get_obs(), self._get_info()
         return obs, info
 
     def step(self, action: np.ndarray):
@@ -149,47 +167,26 @@ class SingleAgentTradingEnv(gym.Env):
         reward = self._calculate_reward()
         self.current_step += 1
         
-        if self.portfolio_value < self.initial_cash * 0.5:
-            self.terminated = True
-            logger.info(f"--- EPISODE TERMINATED at step {self.current_step} due to portfolio value drop. ---")
-            
-        if self.current_step >= self.max_steps:
-            self.truncated = True
-            logger.info(f"--- EPISODE TRUNCATED at step {self.current_step}. Reached max steps. ---")
+        if self.portfolio_value < self.initial_cash * 0.5: self.terminated = True
+        if self.current_step >= self.max_steps: self.truncated = True
         
-        obs = self._get_obs()
-        info = self._get_info()
-        
+        obs, info = self._get_obs(), self._get_info()
         self.prev_portfolio_value = self.portfolio_value
-        
         return obs, reward, self.terminated, self.truncated, info
 
     def _get_obs(self) -> np.ndarray:
         market_features_slice = self.features[self.current_step - self.lookback_window : self.current_step].flatten()
-        
-        obs = np.concatenate([
-            market_features_slice,
-            self.portfolio_weights
-        ]).astype(np.float32)
-        return obs
+        return np.concatenate([market_features_slice, self.portfolio_weights]).astype(np.float32)
 
     def _get_info(self) -> dict:
         date = self.dates[self.current_step] if self.current_step < len(self.dates) else self.dates[-1]
-        return {
-            "date": date,
-            "portfolio_value": self.portfolio_value,
-            "weights": self.portfolio_weights,
-        }
+        return {"date": date, "portfolio_value": self.portfolio_value, "weights": self.portfolio_weights}
 
     def _calculate_reward(self) -> float:
         ratio = np.clip(self.portfolio_value / self.prev_portfolio_value, 1e-10, None)
         step_return = np.log(ratio) if self.prev_portfolio_value > 0 else 0.0
-
         self.high_water_mark = max(self.high_water_mark, self.portfolio_value)
         drawdown = (self.portfolio_value - self.high_water_mark) / self.high_water_mark if self.high_water_mark > 0 else 0.0
         drawdown_penalty = self.reward_config["lambda_dd"] * abs(drawdown)
-
         risk_penalty = self.reward_config["lambda_sigma"] * np.std(self.portfolio_weights[:-1])
-
-        reward = step_return - drawdown_penalty - risk_penalty
-        return float(reward)
+        return float(step_return - drawdown_penalty - risk_penalty)

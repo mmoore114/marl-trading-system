@@ -2,10 +2,10 @@
     --- Backtest Summary ---
     Period: 2025-02-18 to 2025-07-31
     
-    Final Portfolio Value: $110,787.77
-    Total Return: 10.79%
-    Annualized Return: 25.42%
-    Annualized Volatility: 26.99%
-    Sharpe Ratio: 0.94
-    Max Drawdown: -19.15%
+    Final Portfolio Value: $108,547.37
+    Total Return: 8.55%
+    Annualized Return: 20.07%
+    Annualized Volatility: 26.33%
+    Sharpe Ratio: 0.82
+    Max Drawdown: -18.85%
     

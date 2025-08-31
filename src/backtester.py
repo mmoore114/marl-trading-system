@@ -36,7 +36,6 @@ def main():
         logger.error(f"Checkpoint directory not found: {checkpoint_path}")
         return
 
-    # Register the custom environment so Ray knows how to create it
     register_env(
         "SingleAgentTradingEnv-v0",
         lambda env_config: SingleAgentTradingEnv(env_config),
@@ -70,7 +69,6 @@ def main():
     logger.info(f"--- Backtest Complete ---")
     logger.info(f"Finished after {steps} steps. Final Portfolio Value: ${portfolio_values[-1]:,.2f}")
     
-    # --- Reporting ---
     equity_curve = pd.Series(portfolio_values, index=pd.to_datetime(dates), name="equity")
     returns = equity_curve.pct_change().dropna()
     
@@ -81,12 +79,19 @@ def main():
     equity_curve.to_csv(REPORTS_DIR / "backtest_equity_curve.csv")
     logger.info(f"Saved equity curve to: {REPORTS_DIR / 'backtest_equity_curve.csv'}")
 
-    # --- FIX: Calculate metrics robustly ---
     total_return = (equity_curve.iloc[-1] / equity_curve.iloc[0]) - 1
-    annualized_return = qs.stats.annualized_return(returns) if QUANTSTATS_AVAILABLE else (1 + total_return) ** (252 / len(equity_curve)) - 1
-    annualized_vol = qs.stats.volatility(returns) if QUANTSTATS_AVAILABLE else returns.std() * np.sqrt(252)
-    sharpe_ratio = qs.stats.sharpe(returns) if QUANTSTATS_AVAILABLE else annualized_return / annualized_vol
-    max_drawdown = qs.stats.max_drawdown(returns) if QUANTSTATS_AVAILABLE else (equity_curve / equity_curve.cummax() - 1).min()
+    
+    # --- FIX: Use correct QuantStats function names ---
+    if QUANTSTATS_AVAILABLE:
+        annualized_return = qs.stats.cagr(returns)
+        annualized_vol = qs.stats.volatility(returns, annualize=True)
+        sharpe_ratio = qs.stats.sharpe(returns)
+        max_drawdown = qs.stats.max_drawdown(returns)
+    else: # Fallback to manual calculation
+        annualized_return = (1 + total_return) ** (252 / len(equity_curve)) - 1
+        annualized_vol = returns.std() * np.sqrt(252)
+        sharpe_ratio = annualized_return / annualized_vol if annualized_vol != 0 else 0
+        max_drawdown = (equity_curve / equity_curve.cummax() - 1).min()
 
     summary_txt = f"""
     --- Backtest Summary ---
@@ -110,7 +115,5 @@ def main():
     else:
         logger.warning("QuantStats not installed. Skipping HTML report generation.")
 
-
 if __name__ == "__main__":
     main()
-

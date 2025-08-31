@@ -19,7 +19,7 @@ ib-insync==0.9.86
 python-dotenv>=1.0.1
 
 # Analysis & reporting
-quantstats>=0.0.62
+quantstats==0.0.76
 matplotlib>=3.9.0
 seaborn>=0.13.2
 scipy>=1.13.0
@@ -37,4 +37,8 @@ tenacity>=8.5.0
 
 # Optional (for parallelism, etc.)
 joblib>=1.4.2
+ipython
+lxml
+
+
 
